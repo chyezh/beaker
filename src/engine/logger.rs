@@ -8,14 +8,8 @@ use std::{
 
 const MAX_LOG_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
-// Log-structured storage interface definition
-pub trait Logger {
-    // Write a command into logger
-    fn write_cmd(&mut self, cmd: &Command) -> Result<()>;
-}
-
 // Log-structured storage writer implementation, with auto-split-file feature
-struct SplittedFileLogWriter {
+pub struct SplittedFileLogWriter {
     // Element: Splitted file path and its sequence-number
     splits: Vec<(PathBuf, u64)>,
     // Directory of log root path
