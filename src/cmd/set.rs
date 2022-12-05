@@ -1,7 +1,8 @@
 use super::{Frame, Parser, Result};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Set {
     key: String,
     val: String,

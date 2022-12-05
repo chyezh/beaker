@@ -1,7 +1,8 @@
 use super::{Frame, Parser, Result};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Get {
     key: String,
 }

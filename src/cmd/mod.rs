@@ -1,7 +1,8 @@
 use crate::resp::{Frame, Parser};
+use serde::{Deserialize, Serialize};
 
 mod error;
-pub use error::{Error, Result};
+pub use error::Error;
 
 mod get;
 pub use get::Get;
@@ -15,7 +16,9 @@ pub use set::Set;
 mod del;
 pub use del::Del;
 
-#[derive(Debug, PartialEq, Eq)]
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Command {
     Get(Get),
     Ping(Ping),

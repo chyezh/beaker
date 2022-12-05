@@ -1,6 +1,7 @@
 use super::{Frame, Parser, Result};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Eq, PartialEq, Default)]
+#[derive(Debug, Eq, PartialEq, Default, Serialize, Deserialize)]
 pub struct Ping {}
 
 impl Ping {
