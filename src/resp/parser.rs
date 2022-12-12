@@ -14,14 +14,14 @@ impl Parser {
 
     // Get next frame item, return end of stream error if iterating completed
     fn next(&mut self) -> Result<Frame> {
-        self.frame_iter.next().ok_or_else(|| Error::EOS)
+        self.frame_iter.next().ok_or(Error::Eos)
     }
 
     // Get next string type content.
     // return protocol error if next node is not string.
     pub fn next_string(&mut self) -> Result<String> {
         match self.next()? {
-            Frame::Bulk(str) => Ok(String::from_utf8(str.to_vec()).map_err(|err| Error::Invalid)?),
+            Frame::Bulk(str) => Ok(String::from_utf8(str.to_vec()).map_err(|_| Error::Invalid)?),
             Frame::Simple(str) => Ok(str),
             _ => Err(Error::Invalid),
         }

@@ -193,12 +193,12 @@ async fn write_integer_to<W: AsyncWriteExt + Unpin>(val: u64, w: &mut W) -> Resu
 fn get_integer_from_line(src: &mut Cursor<&[u8]>) -> Result<usize> {
     use atoi::atoi;
     let vec = get_line(src)?;
-    Ok(atoi::<usize>(vec).ok_or_else(|| Error::Invalid)?)
+    atoi::<usize>(vec).ok_or(Error::Invalid)
 }
 
 /// get a new line, convert it into utf8 and advance
 fn get_string_from_line(src: &mut Cursor<&[u8]>) -> Result<String> {
-    Ok(String::from_utf8((get_line(src)?).to_vec()).map_err(|err| Error::Invalid)?)
+    String::from_utf8((get_line(src)?).to_vec()).map_err(|_| Error::Invalid)
 }
 
 /// get a new line and advance

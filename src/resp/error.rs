@@ -7,7 +7,7 @@ pub enum Error {
     Incomplete,
 
     #[error("end of stream")]
-    EOS,
+    Eos,
 
     #[error("io")]
     Io {
