@@ -9,4 +9,6 @@ pub use logger::{SplittedFileLogReader, SplittedFileLogWriter};
 mod kv;
 pub use kv::Engine;
 
+mod lsm;
+
 pub type Result<T> = std::result::Result<T, Error>;
