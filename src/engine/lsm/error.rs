@@ -8,4 +8,7 @@ pub enum Error {
 
     #[error("illegal log record")]
     IllegalLogRecord,
+
+    #[error("illegal log")]
+    IllegalLog,
 }
