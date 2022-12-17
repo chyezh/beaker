@@ -3,11 +3,15 @@ use bytes::Bytes;
 mod error;
 pub use error::Error;
 
-mod log;
 mod memtable;
-mod record;
+
+mod log;
+
 mod sstable;
 
+mod util;
+
+// Module result type
 pub type Result<T> = std::result::Result<T, Error>;
 
 // LSM-Tree key
@@ -18,6 +22,6 @@ pub type Key = Vec<u8>;
 pub enum Value {
     Living(Vec<u8>),
 
-    // Dead value
+    // Deleted value
     Tombstone,
 }

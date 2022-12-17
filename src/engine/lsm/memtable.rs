@@ -1,5 +1,5 @@
 use super::{
-    record::{RecordReader, RecordWriter},
+    log::{RecordReader, RecordWriter},
     Error, Key, Result, Value,
 };
 use std::collections::BTreeMap;
@@ -147,7 +147,7 @@ fn scan_sorted_file_at_path(path: &Path) -> Result<Vec<(PathBuf, u64)>> {
     Ok(filenames)
 }
 
-// Encode the KV pair into binary format. no checksum is applied on here, downside record writer promised. Layout:
+// Encode the KV pair into binary format. While no checksum is applied on here, record writer downside has promised. Layout:
 // Value::Living
 // 1. 0-1 value_type
 // 2. 1-5 key_len
@@ -168,15 +168,15 @@ fn encode_kv(key: &Key, value: &Value) -> Vec<u8> {
             v.extend_from_slice(&key.len().to_le_bytes()[0..4]);
             v.extend_from_slice(&value.len().to_le_bytes()[0..4]);
             // Write data
-            v.extend_from_slice(&key[..]);
-            v.extend_from_slice(&value[..]);
+            v.extend_from_slice(key);
+            v.extend_from_slice(value);
             v
         }
         Value::Tombstone => {
             let mut v = Vec::with_capacity(key.len() + KV_TOMBSTONE_VALUE_HEADER);
             v.push(KV_TOMBSTONE_VALUE_TYPE);
             v.extend_from_slice(&key.len().to_le_bytes()[0..4]);
-            v.extend_from_slice(&key[..]);
+            v.extend_from_slice(key);
             v
         }
     }
@@ -196,12 +196,11 @@ fn decode_kv(v: Vec<u8>) -> Result<(Key, Value)> {
             }
             let key_length = u32::from_le_bytes((&v[1..5]).try_into().unwrap()) as usize;
             let value_length = u32::from_le_bytes((&v[5..9]).try_into().unwrap()) as usize;
-            println!("{}, {}", key_length, value_length);
             if v.len() != key_length + value_length + KV_LIVING_VALUE_HEADER {
                 return Err(Error::IllegalLog);
             }
             Ok((
-                Vec::from(&v[KV_LIVING_VALUE_HEADER..KV_LIVING_VALUE_HEADER + key_length]),
+                (&v[KV_LIVING_VALUE_HEADER..KV_LIVING_VALUE_HEADER + key_length]).to_vec(),
                 Value::Living(Vec::from(
                     &v[KV_LIVING_VALUE_HEADER + key_length
                         ..KV_LIVING_VALUE_HEADER + key_length + value_length],
@@ -217,7 +216,7 @@ fn decode_kv(v: Vec<u8>) -> Result<(Key, Value)> {
                 return Err(Error::IllegalLog);
             }
             Ok((
-                Vec::from(&v[KV_TOMBSTONE_VALUE_HEADER..KV_TOMBSTONE_VALUE_HEADER + key_length]),
+                (&v[KV_TOMBSTONE_VALUE_HEADER..KV_TOMBSTONE_VALUE_HEADER + key_length]).to_vec(),
                 Value::Tombstone,
             ))
         }
@@ -228,7 +227,7 @@ fn decode_kv(v: Vec<u8>) -> Result<(Key, Value)> {
 // Implement memtable
 // TODO: replace by skip list in future
 pub struct MemTable {
-    entries: BTreeMap<Vec<u8>, Value>,
+    entries: BTreeMap<Key, Value>,
 }
 
 impl MemTable {
@@ -242,10 +241,7 @@ impl MemTable {
     // Find a value by key from memtable
     fn get(&self, key: &Key) -> Option<Value> {
         debug_assert!(!key.is_empty());
-        match self.entries.get(key) {
-            None => None,
-            Some(v) => Some(v.clone()),
-        }
+        self.entries.get(key).cloned()
     }
 
     // Set a value by key
@@ -332,6 +328,22 @@ mod tests {
             let mut new_bytes = vec![0; size];
             rng.fill_bytes(&mut new_bytes[..]);
             v.push(new_bytes);
+        }
+        v
+    }
+
+    fn generate_random_string(num: usize, max_len: usize) -> Vec<String> {
+        let mut v = Vec::with_capacity(num);
+
+        for _ in 0..num {
+            let mut rng = rand::thread_rng();
+            let size: usize = rng.gen_range(1..max_len);
+            let rand_string = rng
+                .sample_iter(&rand::distributions::Alphanumeric)
+                .take(size)
+                .map(char::from)
+                .collect();
+            v.push(rand_string);
         }
         v
     }
