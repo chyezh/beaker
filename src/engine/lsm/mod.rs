@@ -7,6 +7,7 @@ mod memtable;
 
 mod log;
 
+mod block;
 mod sstable;
 
 mod util;

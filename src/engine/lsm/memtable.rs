@@ -1,5 +1,6 @@
 use super::{
     log::{RecordReader, RecordWriter},
+    util::from_le_bytes_32,
     Error, Key, Result, Value,
 };
 use std::collections::BTreeMap;
@@ -194,8 +195,8 @@ fn decode_kv(v: Vec<u8>) -> Result<(Key, Value)> {
             if v.len() < KV_LIVING_VALUE_HEADER {
                 return Err(Error::IllegalLog);
             }
-            let key_length = u32::from_le_bytes((&v[1..5]).try_into().unwrap()) as usize;
-            let value_length = u32::from_le_bytes((&v[5..9]).try_into().unwrap()) as usize;
+            let key_length = from_le_bytes_32(&v[1..5]);
+            let value_length = from_le_bytes_32(&v[5..9]);
             if v.len() != key_length + value_length + KV_LIVING_VALUE_HEADER {
                 return Err(Error::IllegalLog);
             }
@@ -211,7 +212,7 @@ fn decode_kv(v: Vec<u8>) -> Result<(Key, Value)> {
             if v.len() < KV_TOMBSTONE_VALUE_HEADER {
                 return Err(Error::IllegalLog);
             }
-            let key_length = u32::from_le_bytes((&v[1..5]).try_into().unwrap()) as usize;
+            let key_length = from_le_bytes_32(&v[1..5]);
             if v.len() != key_length + KV_TOMBSTONE_VALUE_HEADER {
                 return Err(Error::IllegalLog);
             }

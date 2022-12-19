@@ -7,11 +7,15 @@
 //    type: uint8          // One of FULL, FIRST, MIDDLE, LAST
 //    data: uint8[length]
 
-use super::{Error, Result};
-use std::io::{self, Cursor, Read, Write};
+use crate::engine::lsm::util::from_le_bytes_32;
+
+use super::{
+    util::{checksum, read_exact},
+    Error, Result,
+};
+use std::io::{Cursor, Read, Write};
 
 use bytes::Buf;
-use crc::{Crc, CRC_32_ISCSI};
 
 const RECORD_BLOCK_SIZE: usize = 32 * 1024; // 32kb for every block
 const RECORD_HEADER_SIZE: usize = 1 + 2 + 4; // record_type + record_len + record_checksum
@@ -45,7 +49,6 @@ pub struct RecordReader<R: Read> {
     reader: R,
     buffer: Vec<u8>,
     offset: usize,
-    crc: Crc<u32>,
 }
 
 impl<R: Read> RecordReader<R> {
@@ -54,7 +57,6 @@ impl<R: Read> RecordReader<R> {
             reader,
             buffer: Vec::with_capacity(RECORD_BLOCK_SIZE),
             offset: 0,
-            crc: Crc::<u32>::new(&CRC_32_ISCSI),
         };
         r.buffer.resize(RECORD_BLOCK_SIZE, b'\x00');
         r.offset = r.buffer.len();
@@ -67,8 +69,10 @@ impl<R: Read> RecordReader<R> {
     fn parse_record(&mut self) -> Result<Option<(RecordType, &[u8])>> {
         debug_assert!(self.offset <= self.buffer.len());
         if self.buffer.len() - self.offset < RECORD_HEADER_SIZE {
-            // Skip the empty tailer of block
-            self.fill_buffer_with_new_block()?;
+            // Skip the empty tailer of block and fill the buffer
+            read_exact(&mut self.reader, &mut self.buffer)?;
+            self.offset = 0;
+
             // Reaching the EOF or discovering incomplete record is expected log format, return None
             if self.buffer.len() < RECORD_HEADER_SIZE {
                 return Ok(None);
@@ -98,50 +102,13 @@ impl<R: Read> RecordReader<R> {
         let data = &self.buffer[self.offset + RECORD_HEADER_SIZE..data_right_boundary];
 
         // Check checksum
-        let checksum = u32::from_le_bytes(
-            (&self.buffer[self.offset..self.offset + 4])
-                .try_into()
-                .unwrap(),
-        );
-        if self.crc.checksum(data) != checksum {
+        let checksum_result = from_le_bytes_32(&self.buffer[self.offset..self.offset + 4]) as u32;
+        if checksum(data) != checksum_result {
             return Err(Error::IllegalLogRecord);
         }
 
         self.offset += length + RECORD_HEADER_SIZE;
         Ok(Some((record_type, data)))
-    }
-
-    // Fill a new block into buffer
-    fn fill_buffer_with_new_block(&mut self) -> Result<()> {
-        // Clear the buffer and fill a new block
-        let mut last: usize = 0;
-        loop {
-            match self.reader.read(&mut self.buffer[last..]) {
-                Ok(n) if n == 0 => {
-                    // Reach EOF
-                    unsafe {
-                        self.buffer.set_len(last);
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    last += n;
-                    debug_assert!(last <= self.buffer.len());
-                    if last == self.buffer.len() {
-                        // Buffer is filled
-                        break;
-                    }
-                    // Continue to fill buffer if buffer has empty space
-                }
-                Err(e) if matches!(e.kind(), io::ErrorKind::Interrupted) => {
-                    // Continue to fill buffer if io is interrupted
-                }
-                Err(e) => Err(e)?,
-            }
-        }
-        // Reset the buffer offset
-        self.offset = 0;
-        Ok(())
     }
 }
 
@@ -213,7 +180,6 @@ pub struct RecordWriter<W: Write> {
     writer: W,
     block_offset: usize,
     total_written: usize,
-    crc: Crc<u32>,
 }
 
 impl<W: Write> RecordWriter<W> {
@@ -222,7 +188,6 @@ impl<W: Write> RecordWriter<W> {
             writer: file,
             block_offset: 0,
             total_written: 0,
-            crc: Crc::<u32>::new(&CRC_32_ISCSI),
         }
     }
 
@@ -299,7 +264,7 @@ impl<W: Write> RecordWriter<W> {
         // checksum: 4 bytes.
         // length: 2 bytes.
         // record type: 1 bytes.
-        let checksum_bytes = self.crc.checksum(data).to_le_bytes();
+        let checksum_bytes = checksum(data).to_le_bytes();
         let length_bytes = length.to_le_bytes();
         let header: [u8; RECORD_HEADER_SIZE] = [
             checksum_bytes[0],
