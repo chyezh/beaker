@@ -130,16 +130,15 @@ impl Block {
     }
 
     // Create a new iterator on this block
-    fn iter(&self) -> BlockIterator {
+    pub fn iter(&self) -> BlockIterator {
         BlockIterator::new(self)
     }
 
     // Search a key in this block, block items is assumed to be sorted in lexicographic order
-    fn search_key(&self, key: &[u8]) -> Option<&[u8]> {
-        for view in self.iter() {
-            let current_key = &view.key[..];
-            match current_key.cmp(key) {
-                Ordering::Equal => return Some(view.value),
+    pub fn search_key(&self, key: &[u8]) -> Option<&[u8]> {
+        for (current_key, value) in self.iter() {
+            match (&current_key[..]).cmp(key) {
+                Ordering::Equal => return Some(value),
                 // KV Items are sorted, return None immediately if current key is lexicographic greater than target key
                 Ordering::Greater => return None,
                 _ => continue,
@@ -151,9 +150,9 @@ impl Block {
 
 // Observer for a kv item in the block
 // TODO: optimize key read
-struct KVView<'a> {
-    key: Vec<u8>,
-    value: &'a [u8],
+pub struct KVView<'a> {
+    pub key: Vec<u8>,
+    pub value: &'a [u8],
 }
 
 impl<'a> KVView<'a> {
@@ -163,7 +162,7 @@ impl<'a> KVView<'a> {
 }
 
 // Block iteration implement
-struct BlockIterator<'a> {
+pub struct BlockIterator<'a> {
     data: &'a [u8],
     compress_restart_offset: &'a [usize],
     last_key: Vec<u8>,
@@ -221,7 +220,7 @@ impl<'a> BlockIterator<'a> {
 }
 
 impl<'a> Iterator for BlockIterator<'a> {
-    type Item = KVView<'a>;
+    type Item = (Vec<u8>, &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
         debug_assert!(matches!(self.err, None));
@@ -252,7 +251,7 @@ impl<'a> Iterator for BlockIterator<'a> {
                     .copied()
                     .collect();
 
-                Some(KVView { key, value })
+                Some((key, value))
             }
             Err(e) => {
                 // Error happened, stop iteration
@@ -265,8 +264,6 @@ impl<'a> Iterator for BlockIterator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::lsm::block;
-
     use super::*;
 
     #[test]

@@ -1,8 +1,22 @@
 use super::Result;
 use crc::{Crc, CRC_32_ISCSI};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 static CRC_INSTANCE: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+
+// Seek reader and read n exact bytes
+pub fn seek_and_read_buf<R: Read + Seek>(
+    reader: &mut R,
+    seek: SeekFrom,
+    n: usize,
+) -> Result<Vec<u8>> {
+    reader.seek(seek)?;
+    let mut buffer = Vec::with_capacity(n);
+    buffer.resize(n, b'\x00');
+
+    read_exact(reader, &mut buffer)?;
+    Ok(buffer)
+}
 
 // Read exact bytes(buffer.len()) from reader into buffer.
 // When EOF is reached, resize buffer into bytes len that already read.

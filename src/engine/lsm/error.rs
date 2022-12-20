@@ -12,9 +12,15 @@ pub enum Error {
     #[error("illegal log")]
     IllegalLog,
 
-    #[error("illegal table")]
-    IllegalTable,
+    #[error("bad sstable")]
+    BadSSTable,
 
     #[error("bad sstable block")]
     BadSSTableBlock,
+
+    #[error("bad sstable index")]
+    BadSSTableIndex,
+
+    #[error("bad sstable footer")]
+    BadSSTableBlockFooter,
 }
