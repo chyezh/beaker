@@ -254,9 +254,9 @@ impl MemTable {
 
 #[cfg(test)]
 mod tests {
-    use rand::{Rng, RngCore};
-
     use super::*;
+    use crate::engine::lsm::util::generate_random_bytes_vec;
+
     #[test]
     fn test_log_with_random_case() {
         let test_count = 100;
@@ -318,34 +318,5 @@ mod tests {
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             assert_eq!(memtable.get(key).unwrap(), value[..]);
         }
-    }
-
-    fn generate_random_bytes_vec(num: usize, max_len: usize) -> Vec<Vec<u8>> {
-        let mut v = Vec::with_capacity(num);
-
-        for _ in 0..num {
-            let mut rng = rand::thread_rng();
-            let size: usize = rng.gen_range(1..max_len);
-            let mut new_bytes = vec![0; size];
-            rng.fill_bytes(&mut new_bytes[..]);
-            v.push(new_bytes);
-        }
-        v
-    }
-
-    fn generate_random_string(num: usize, max_len: usize) -> Vec<String> {
-        let mut v = Vec::with_capacity(num);
-
-        for _ in 0..num {
-            let mut rng = rand::thread_rng();
-            let size: usize = rng.gen_range(1..max_len);
-            let rand_string = rng
-                .sample_iter(&rand::distributions::Alphanumeric)
-                .take(size)
-                .map(char::from)
-                .collect();
-            v.push(rand_string);
-        }
-        v
     }
 }

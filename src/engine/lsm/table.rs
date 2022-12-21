@@ -1,23 +1,16 @@
-use crate::engine::lsm::{
-    block,
-    util::{from_le_bytes_32, from_le_bytes_64},
-};
+use crate::engine::lsm::util::{from_le_bytes_32, from_le_bytes_64};
 
 use super::{
-    block::{Block, BlockBuilder},
-    util::{checksum, read_exact, seek_and_read_buf},
+    block::{Block, BlockBuilder, BlockIntoIterator},
+    util::{checksum, seek_and_read_buf},
     Error, Result,
 };
-use std::{
-    collections::BTreeMap,
-    io::{Read, Seek, SeekFrom, Write},
-};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 const FOOTER_SIZE: usize = 12; // 12bytes
 const BLOCK_DEFAULT_SIZE: usize = 4 * 1024; // 4kb
 
 struct Table<R: Seek + Read> {
-    footer: Footer,
     index: Index,
     reader: R,
     range: (Vec<u8>, Vec<u8>), // Key range of this table [xxx, xxx]
@@ -99,7 +92,6 @@ impl<R: Seek + Read> Table<R> {
         }
 
         Ok(Table {
-            footer,
             index,
             reader,
             range: (first_key, last_key),
@@ -138,6 +130,85 @@ impl<R: Seek + Read> Table<R> {
 
     fn in_range(&self, key: &[u8]) -> bool {
         key >= &self.range.0[..] && key <= &self.range.1[..]
+    }
+}
+
+impl<R: Read + Seek> IntoIterator for Table<R> {
+    type Item = (Vec<u8>, Vec<u8>);
+    type IntoIter = TableIntoIterator<R>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        TableIntoIterator {
+            block: None,
+            index: self.index.index.into_iter(),
+            reader: self.reader,
+            err: None,
+        }
+    }
+}
+
+pub struct TableIntoIterator<R: Seek + Read> {
+    block: Option<BlockIntoIterator>,
+    index: std::vec::IntoIter<BlockItem>,
+    reader: R,
+    err: Option<Error>,
+}
+
+impl<R: Seek + Read> TableIntoIterator<R> {
+    fn error(self) -> Option<Error> {
+        self.err
+    }
+}
+
+impl<R: Seek + Read> Iterator for TableIntoIterator<R> {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match &mut self.block {
+                Some(block) => {
+                    // Read the next kv
+                    if let Some((key, value)) = block.next() {
+                        return Some((key, value.to_vec()));
+                    }
+                    // Reach the end of block iteration
+                    self.block = None;
+                }
+                // Read a new block
+                None => {
+                    // Search index if block is none
+                    if let Some(block_info) = self.index.next() {
+                        // Read a new block
+                        let block_buffer = seek_and_read_buf(
+                            &mut self.reader,
+                            SeekFrom::Start(block_info.offset),
+                            block_info.size,
+                        );
+                        if block_buffer.is_err() {
+                            self.err = block_buffer.err();
+                            return None;
+                        }
+                        let block_buffer = block_buffer.unwrap();
+
+                        debug_assert_eq!(block_buffer.len(), block_info.size);
+                        if block_buffer.len() != block_info.size {
+                            self.err = Some(Error::BadSSTable);
+                            return None;
+                        }
+                        let block = Block::from_bytes(block_buffer);
+                        if block.is_err() {
+                            self.err = block.err();
+                            return None;
+                        }
+                        let block = block.unwrap();
+                        self.block = Some(block.into_iter());
+                    } else {
+                        // Read the end of index iteration
+                        return None;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -304,13 +375,39 @@ impl<W: Write> TableBuilder<W> {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Buf;
+    use crate::engine::lsm::util::generate_random_bytes_vec;
 
     use super::*;
-    use std::io::Cursor;
+
+    #[test]
+    fn test_table_build_and_search_with_random_case() {
+        use std::io::Cursor;
+
+        // Generate random test key
+        let test_count = 1000;
+        let mut test_case_key = generate_random_bytes_vec(test_count, 10000);
+        let test_case_value = generate_random_bytes_vec(test_count, 10 * 32 * 1024);
+        test_case_key.sort();
+
+        // build the table
+        let mut builder = TableBuilder::new(Vec::new());
+        for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
+            builder.add(key, value).unwrap();
+        }
+        builder.finish().unwrap();
+
+        // test search operation
+        let buffer = Cursor::new(builder.writer);
+        let mut table = Table::open(buffer).unwrap();
+        for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
+            assert_eq!(&table.search_key(key).unwrap().unwrap(), value);
+        }
+    }
 
     #[test]
     fn test_table_build_and_search() {
+        use std::io::Cursor;
+
         let v = Vec::new();
         let mut builder = TableBuilder::new(v);
         builder.add(b"123456789", b"1234567689").unwrap();

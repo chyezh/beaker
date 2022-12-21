@@ -63,3 +63,18 @@ pub fn from_le_bytes_32(data: &[u8]) -> usize {
     debug_assert_eq!(data.len(), 4);
     u32::from_le_bytes(data.try_into().unwrap()) as usize
 }
+
+#[cfg(test)]
+pub fn generate_random_bytes_vec(num: usize, max_len: usize) -> Vec<Vec<u8>> {
+    use rand::{Rng, RngCore};
+
+    let mut v = Vec::with_capacity(num);
+    for _ in 0..num {
+        let mut rng = rand::thread_rng();
+        let size: usize = rng.gen_range(1..max_len);
+        let mut new_bytes = vec![0; size];
+        rng.fill_bytes(&mut new_bytes[..]);
+        v.push(new_bytes);
+    }
+    v
+}
