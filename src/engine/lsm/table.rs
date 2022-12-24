@@ -5,12 +5,15 @@ use super::{
     util::{checksum, seek_and_read_buf},
     Error, Result,
 };
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::{
+    cmp::Ordering,
+    io::{Read, Seek, SeekFrom, Write},
+};
 
 const FOOTER_SIZE: usize = 12; // 12bytes
 const BLOCK_DEFAULT_SIZE: usize = 4 * 1024; // 4kb
 
-struct Table<R: Seek + Read> {
+pub struct Table<R: Seek + Read> {
     index: Index,
     reader: R,
     range: (Vec<u8>, Vec<u8>), // Key range of this table [xxx, xxx]
@@ -98,7 +101,7 @@ impl<R: Seek + Read> Table<R> {
         })
     }
 
-    fn search_key(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn search_key(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if !self.in_range(key) {
             return Ok(None);
         }
@@ -155,8 +158,12 @@ pub struct TableIntoIterator<R: Seek + Read> {
 }
 
 impl<R: Seek + Read> TableIntoIterator<R> {
-    fn error(self) -> Option<Error> {
-        self.err
+    fn error(self) -> Result<()> {
+        if let Some(err) = self.err {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -210,6 +217,71 @@ impl<R: Seek + Read> Iterator for TableIntoIterator<R> {
             }
         }
     }
+}
+
+// Compact two Table and build new table
+pub fn compact<R: Read + Seek, W: Write>(
+    prev: Table<R>,
+    next: Table<R>,
+    builder: &mut TableBuilder<W>,
+) -> Result<()> {
+    let mut prev_iter = prev.into_iter();
+    let mut next_iter = next.into_iter();
+
+    let mut prev_new_kv: Option<(Vec<u8>, Vec<u8>)> = None;
+    let mut next_new_kv: Option<(Vec<u8>, Vec<u8>)> = None;
+
+    // Tables are sorted by key, do merging by using role of merge sort.
+    loop {
+        if prev_new_kv.is_none() {
+            prev_new_kv = prev_iter.next();
+        }
+        if next_new_kv.is_none() {
+            next_new_kv = next_iter.next();
+        }
+
+        // Finish tow iteration, stop merging
+        if next_new_kv.is_none() && prev_new_kv.is_none() {
+            break;
+        } else if next_new_kv.is_some() && prev_new_kv.is_none() {
+            let (key, value) = next_new_kv.unwrap();
+            builder.add(&key, &value)?;
+            next_new_kv = None;
+        } else if next_new_kv.is_none() && prev_new_kv.is_some() {
+            let (key, value) = prev_new_kv.unwrap();
+            builder.add(&key, &value)?;
+            prev_new_kv = None;
+        } else {
+            match next_new_kv.as_ref().unwrap().0[..].cmp(&prev_new_kv.as_ref().unwrap().0[..]) {
+                Ordering::Equal => {
+                    // Always use next table if key is same
+                    let (key, value) = next_new_kv.unwrap();
+                    builder.add(&key, &value)?;
+                    next_new_kv = None;
+                    prev_new_kv = None;
+                }
+                Ordering::Greater => {
+                    let (key, value) = prev_new_kv.unwrap();
+                    builder.add(&key, &value)?;
+                    prev_new_kv = None;
+                }
+                Ordering::Less => {
+                    let (key, value) = next_new_kv.unwrap();
+                    builder.add(&key, &value)?;
+                    next_new_kv = None;
+                }
+            }
+        }
+    }
+
+    // Checkout iteration success
+    prev_iter.error()?;
+    next_iter.error()?;
+
+    // Finish the build
+    builder.finish()?;
+
+    Ok(())
 }
 
 struct Footer {
@@ -289,7 +361,7 @@ impl Index {
 }
 
 // Build a single sstable, use leveldb definition without filter block.
-struct TableBuilder<W: Write> {
+pub struct TableBuilder<W: Write> {
     writer: W,
     data_block: BlockBuilder,
     index_block: BlockBuilder,
@@ -351,8 +423,8 @@ impl<W: Write> TableBuilder<W> {
 
     fn add_new_index(&mut self, offset: u64, data_size: usize) {
         let mut new_index_value: [u8; 12] = [0; 12];
-        (&mut new_index_value[0..8]).copy_from_slice(&offset.to_le_bytes()[0..8]);
-        (&mut new_index_value[8..12]).copy_from_slice(&data_size.to_le_bytes()[0..4]);
+        new_index_value[0..8].copy_from_slice(&offset.to_le_bytes()[0..8]);
+        new_index_value[8..12].copy_from_slice(&data_size.to_le_bytes()[0..4]);
 
         self.index_block.add(&self.last_key, &new_index_value)
     }
@@ -378,18 +450,73 @@ mod tests {
     use crate::engine::lsm::util::generate_random_bytes_vec;
 
     use super::*;
+    use std::{collections::HashMap, io::Cursor};
 
     #[test]
     fn test_table_build_and_search_with_random_case() {
-        use std::io::Cursor;
+        let (test_case_key, test_case_value, mut table) = create_new_table_with_random_case(1000);
+        for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
+            assert_eq!(&table.search_key(key).unwrap().unwrap(), value);
+        }
+    }
 
-        // Generate random test key
-        let test_count = 1000;
+    #[test]
+    fn test_compact_table_with_random_case() {
+        let (test_case_key_1, test_case_value_1, mut table_1) =
+            create_new_table_with_random_case(1500);
+        for (key, value) in test_case_key_1.iter().zip(test_case_value_1.iter()) {
+            assert_eq!(&table_1.search_key(key).unwrap().unwrap(), value);
+        }
+
+        let (test_case_key_2, test_case_value_2, mut table_2) =
+            create_new_table_with_random_case(1000);
+        for (key, value) in test_case_key_2.iter().zip(test_case_value_2.iter()) {
+            assert_eq!(&table_2.search_key(key).unwrap().unwrap(), value);
+        }
+
+        // Build up table
+        let mut builder = TableBuilder::new(Vec::new());
+        compact(table_1, table_2, &mut builder).unwrap();
+
+        // test search operation
+        let writer = builder.writer;
+        let buffer = Cursor::new(writer);
+        let mut table = Table::open(buffer).unwrap();
+
+        let kv_1: HashMap<_, _> = test_case_key_1
+            .iter()
+            .zip(test_case_value_1.iter())
+            .collect();
+
+        let kv_2: HashMap<_, _> = test_case_key_2
+            .iter()
+            .zip(test_case_value_2.iter())
+            .collect();
+
+        for key in test_case_key_1.iter().chain(test_case_key_2.iter()) {
+            let value = table.search_key(key).unwrap().unwrap();
+            // Checkout table 2 first
+            if let Some(value2) = kv_2.get(key) {
+                assert_eq!(value, **value2);
+                continue;
+            }
+            if let Some(value2) = kv_1.get(key) {
+                assert_eq!(value, **value2);
+                continue;
+            }
+            panic!("key lost after compaction");
+        }
+    }
+
+    fn create_new_table_with_random_case(
+        test_count: usize,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Table<Cursor<Vec<u8>>>) {
+        // Generate random test case
         let mut test_case_key = generate_random_bytes_vec(test_count, 10000);
         let test_case_value = generate_random_bytes_vec(test_count, 10 * 32 * 1024);
         test_case_key.sort();
 
-        // build the table
+        // Build up table
         let mut builder = TableBuilder::new(Vec::new());
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             builder.add(key, value).unwrap();
@@ -398,10 +525,9 @@ mod tests {
 
         // test search operation
         let buffer = Cursor::new(builder.writer);
-        let mut table = Table::open(buffer).unwrap();
-        for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            assert_eq!(&table.search_key(key).unwrap().unwrap(), value);
-        }
+        let table = Table::open(buffer).unwrap();
+
+        (test_case_key, test_case_value, table)
     }
 
     #[test]
