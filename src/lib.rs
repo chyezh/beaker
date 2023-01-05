@@ -1,5 +1,6 @@
 mod cmd;
 mod engine;
+mod raft;
 mod resp;
 mod server;
 mod util;
