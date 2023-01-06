@@ -24,7 +24,15 @@ message RequestVoteReply {
 }
 
 message AppendEntriesArgs {
+    uint64 term = 1;
+    uint64 leader_id = 2;
+    uint64 prev_log_index = 3;
+    uint64 prev_log_term = 4;
+    uint64 leader_commit = 5;
+    uint64 entries = 6;
 }
 
 message AppendEntriesReply {
+    uint64 term = 1;
+    bool success = 2;
 }

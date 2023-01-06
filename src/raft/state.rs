@@ -6,7 +6,7 @@ enum Role {
     Leader,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 struct Peer {
     // Index of the next log entry to send to that server
     // Initialized to leader last log index + 1
@@ -17,7 +17,7 @@ struct Peer {
     match_index: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     // Role of this node
     role: Role,
@@ -48,6 +48,27 @@ pub struct State {
 }
 
 impl State {
+    pub fn new(peers_count: usize, me_index: usize) -> Self {
+        let peers = vec![
+            Peer {
+                next_index: 0,
+                match_index: 0,
+            };
+            peers_count
+        ];
+
+        State {
+            role: Role::Follower,
+            me_index,
+            current_term: 0,
+            voted_for: None,
+            log: vec![],
+            commit_index: 0,
+            last_applied: 0,
+            peers,
+        }
+    }
+
     #[inline]
     pub fn is_leader(&self) -> bool {
         matches!(self.role, Role::Leader)
@@ -88,6 +109,12 @@ impl State {
     #[inline]
     pub fn vote_for(&mut self, candidate_id: u64) {
         self.voted_for = Some(candidate_id as usize);
+    }
+
+    // Access voted for
+    #[inline]
+    pub fn voted_for(&self) -> Option<usize> {
+        self.voted_for
     }
 
     // Access me index
