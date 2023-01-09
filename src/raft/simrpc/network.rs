@@ -2,6 +2,7 @@ use super::{server::Server, Request, TestError};
 use super::{Response, Result};
 use rand::{thread_rng, Rng};
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -16,17 +17,17 @@ struct ExecutionInfo {
 }
 
 struct Endpoints {
-    clients: HashMap<String, mpsc::Receiver<Request>>,
     servers: HashMap<String, Server>,
+    // Map of client_name and server_name
     connections: HashMap<String, String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct NetworkStatus {
-    // delay milliseconds across network
+    // Delay milliseconds across network
     delay_upper_bound_ms: u32,
 
-    // delay milliseconds across network
+    // Delay milliseconds across network
     delay_lower_bound_ms: u32,
 
     // Permillage of packet loss across network, [0,1000]
@@ -46,7 +47,7 @@ impl NetworkStatus {
 
 pub struct NetworkInner {
     status: Mutex<NetworkStatus>,
-    // Endpoints record, server, client, connection
+    // Endpoints record, server, connection
     endpoints: Mutex<Endpoints>,
 }
 
@@ -56,23 +57,35 @@ pub struct Network {
 }
 
 impl Network {
-    pub fn start(&self, mut channel: mpsc::Receiver<Request>) {
-        let network = self.clone();
+    pub fn new() -> Self {
+        Network {
+            inner: Arc::new(NetworkInner {
+                status: Mutex::new(NetworkStatus {
+                    delay_upper_bound_ms: 40,
+                    delay_lower_bound_ms: 20,
+                    packet_loss_permillage: 50,
+                }),
+                endpoints: Mutex::new(Endpoints {
+                    servers: HashMap::new(),
+                    connections: HashMap::new(),
+                }),
+            }),
+        }
+    }
 
-        tokio::spawn(async move {
-            // Accept new rpc request
-            while let Some(request) = channel.recv().await {
-                // Dispatch to handle rpc
-                let mut new_network = network.clone();
-                tokio::spawn(async move {
-                    new_network.handle_rpc(request).await;
-                });
-            }
-        });
+    pub async fn start(&self, mut channel: mpsc::Receiver<Request>) {
+        // Accept new rpc request
+        while let Some(request) = channel.recv().await {
+            // Dispatch to handle rpc
+            let mut new_network = self.clone();
+            tokio::spawn(async move {
+                new_network.handle_rpc(request).await;
+            });
+        }
     }
 
     // Simulating network delay, request lost, reply lost like real world network
-    pub async fn handle_rpc(&mut self, mut request: Request) {
+    pub async fn handle_rpc(&mut self, request: Request) {
         // Copy rpc execution info
         // Get target server
         let server = {
@@ -114,10 +127,6 @@ impl Network {
         self.get_endpoints()
             .servers
             .insert(server.name().to_string(), server);
-    }
-
-    pub fn add_client(&mut self, client_name: String, receiver: mpsc::Receiver<Request>) {
-        self.get_endpoints().clients.insert(client_name, receiver);
     }
 
     pub fn connect(&mut self, client_name: &str, server_name: &str) {

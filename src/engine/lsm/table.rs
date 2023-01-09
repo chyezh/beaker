@@ -45,7 +45,6 @@ impl<R: Seek + Read> Table<R> {
         let index_len = index_buffer.len();
         let check_sum_result = from_le_bytes_32(&index_buffer[index_len - 4..index_len]) as u32;
         if checksum(&index_buffer[0..index_len - 4]) != check_sum_result {
-            println!("checksum:{:?}", check_sum_result);
             return Err(Error::BadSSTable);
         }
         index_buffer.resize(index_len - 4, b'\x00');

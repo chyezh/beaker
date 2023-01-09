@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait Service: Sync + Send + 'static {
-    async fn handle(&self, data: &[u8]) -> Vec<u8>;
+    async fn handle(&self, data: &[u8]) -> Result<Vec<u8>>;
 }
 
-struct ServerBuilder {
+pub struct ServerBuilder {
     inner: ServerInner,
 }
 
@@ -57,7 +57,7 @@ impl Server {
             .ok_or(TestError::ServiceLoss)?;
 
         Ok(Response {
-            data: service.handle(&request.data).await,
+            data: service.handle(&request.data).await?,
         })
     }
 }

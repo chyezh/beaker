@@ -1,3 +1,5 @@
+use crate::raft::error;
+
 #[cfg(test)]
 #[derive(thiserror::Error, Debug)]
 pub enum TestError {
@@ -12,4 +14,7 @@ pub enum TestError {
 
     #[error("channel loss")]
     ChannelLoss,
+
+    #[error("serialization failed")]
+    SerializationFailed,
 }

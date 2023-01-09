@@ -1,16 +1,21 @@
 // Simulation rpc for test
 
 mod client;
+pub use client::Client;
+
 mod error;
 pub use error::TestError;
 
 mod network;
-mod server;
+pub use network::Network;
 
-use super::{Error, Result};
+mod server;
+pub use server::{Server, ServerBuilder, Service};
+
+use super::Result;
 use tokio::sync::oneshot;
 
-struct Request {
+pub struct Request {
     client_name: String,
     service_name: String,
     data: Vec<u8>,
@@ -19,7 +24,7 @@ struct Request {
 }
 
 impl Request {
-    fn new(service_name: String, data: Vec<u8>) -> Self {
+    pub fn new(service_name: String, data: Vec<u8>) -> Self {
         let (tx, rx) = oneshot::channel::<Result<Response>>();
         Request {
             client_name: "".to_string(),
@@ -35,6 +40,7 @@ impl Request {
         &mut self,
         client_name: String,
     ) -> oneshot::Receiver<Result<Response>> {
+        self.client_name = client_name;
         self.response_receiver.take().unwrap()
     }
 
@@ -44,6 +50,6 @@ impl Request {
     }
 }
 
-struct Response {
-    data: Vec<u8>,
+pub struct Response {
+    pub data: Vec<u8>,
 }

@@ -1,5 +1,3 @@
-use tokio::sync::broadcast::error::SendError;
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("tonic status")]

@@ -1,5 +1,6 @@
 use super::rpc::*;
 use super::state::State;
+use super::{Error, Result};
 use rand::Rng;
 use std::{
     ops::Add,
@@ -201,7 +202,7 @@ impl<C: RaftClient> RafterInner<C> {
             state.set_as_follower_in_new_term(args.term);
             state.vote_for(args.candidate_id);
             RequestVoteReply {
-                term: current_term,
+                term: args.term,
                 vote_granted: true,
             }
         }
@@ -240,6 +241,7 @@ impl<C: RaftClient> RafterInner<C> {
     }
 }
 
+#[derive(Clone)]
 // Implementation for Raft algorithm
 pub struct Rafter<C> {
     inner: Arc<Mutex<RafterInner<C>>>,
@@ -253,7 +255,6 @@ impl<C: RaftClient> Rafter<C> {
 
         raft.start_election_task();
         raft.start_heartbeat_task();
-
         raft
     }
 
@@ -278,7 +279,7 @@ impl<C: RaftClient> Rafter<C> {
         let raft = Arc::clone(&self.inner);
         tokio::spawn(async move {
             // TODO: should configurable
-            let mut interval = time::interval(Duration::from_millis(25));
+            let mut interval = time::interval(Duration::from_millis(100));
             loop {
                 // Send heartbeat periodically
                 interval.tick().await;
@@ -294,7 +295,7 @@ impl<C: RaftClient> Raft for Rafter<C> {
     async fn request_vote(
         &self,
         request: Request<RequestVoteArgs>,
-    ) -> Result<Response<RequestVoteReply>, Status> {
+    ) -> std::result::Result<Response<RequestVoteReply>, Status> {
         // TODO: Lock optimize
         Ok(Response::new(
             self.inner.lock().unwrap().vote(request.get_ref()),
@@ -305,9 +306,143 @@ impl<C: RaftClient> Raft for Rafter<C> {
     async fn append_entries(
         &self,
         request: Request<AppendEntriesArgs>,
-    ) -> Result<Response<AppendEntriesReply>, Status> {
+    ) -> std::result::Result<Response<AppendEntriesReply>, Status> {
         Ok(Response::new(
             self.inner.lock().unwrap().append_entries(request.get_ref()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    const REQUEST_VOTE_SERVICE_NAME: &str = "request_vote";
+    const APPEND_ENTRIES_SERVICE_NAME: &str = "append_entries";
+
+    use super::{
+        super::rpc::RaftClient,
+        super::simrpc::{Client, Network, Request, Server, ServerBuilder, Service, TestError},
+        AppendEntriesArgs, AppendEntriesReply, Rafter, RequestVoteArgs, RequestVoteReply, Result,
+    };
+    use prost::Message;
+    use tokio::sync::mpsc;
+    use tonic::async_trait;
+
+    #[test]
+    fn test_leader_election() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed building the tokio runtime");
+        let _guard = runtime.enter();
+
+        let (network, channel) = create_network(5);
+
+        runtime.block_on(async move { network.start(channel).await });
+    }
+
+    #[derive(Clone)]
+    struct TestRaftClient {
+        client: Client,
+    }
+
+    #[async_trait]
+    impl RaftClient for TestRaftClient {
+        // Request vote rpc
+        async fn request_vote(&mut self, request: RequestVoteArgs) -> Result<RequestVoteReply> {
+            let v = request.encode_to_vec();
+
+            let response = self
+                .client
+                .rpc(Request::new(REQUEST_VOTE_SERVICE_NAME.to_string(), v))
+                .await?;
+
+            let response = RequestVoteReply::decode(&response.data[..])
+                .map_err(|_| TestError::SerializationFailed)?;
+            Ok(response)
+        }
+
+        // Append entries rpc
+        async fn append_entries(
+            &mut self,
+            request: AppendEntriesArgs,
+        ) -> Result<AppendEntriesReply> {
+            let v = request.encode_to_vec();
+            let response = self
+                .client
+                .rpc(Request::new(APPEND_ENTRIES_SERVICE_NAME.to_string(), v))
+                .await?;
+
+            let response = AppendEntriesReply::decode(&response.data[..])
+                .map_err(|_| TestError::SerializationFailed)?;
+            Ok(response)
+        }
+    }
+
+    struct RequestVoteService<C>(Rafter<C>);
+    struct AppendEntriesService<C>(Rafter<C>);
+
+    #[async_trait]
+    impl<C: RaftClient> Service for RequestVoteService<C> {
+        async fn handle(&self, data: &[u8]) -> Result<Vec<u8>> {
+            let request =
+                RequestVoteArgs::decode(data).map_err(|_| TestError::SerializationFailed)?;
+            let response = self.0.inner.lock().unwrap().vote(&request);
+            Ok(response.encode_to_vec())
+        }
+    }
+
+    #[async_trait]
+    impl<C: RaftClient> Service for AppendEntriesService<C> {
+        async fn handle(&self, data: &[u8]) -> Result<Vec<u8>> {
+            let request =
+                AppendEntriesArgs::decode(data).map_err(|_| TestError::SerializationFailed)?;
+            let response = self.0.inner.lock().unwrap().append_entries(&request);
+            Ok(response.encode_to_vec())
+        }
+    }
+
+    fn create_raft_server<C: RaftClient>(peers: Vec<C>, me_index: usize) -> Server {
+        let rafter = Rafter::new(peers, me_index);
+
+        let mut server = ServerBuilder::new(format!("server_{}", me_index));
+        server.add_service(
+            REQUEST_VOTE_SERVICE_NAME.to_string(),
+            Box::new(RequestVoteService(rafter.clone())),
+        );
+        server.add_service(
+            APPEND_ENTRIES_SERVICE_NAME.to_string(),
+            Box::new(RequestVoteService(rafter)),
+        );
+        server.build()
+    }
+
+    fn create_network(node_num: usize) -> (Network, mpsc::Receiver<Request>) {
+        let mut network = Network::new();
+        // Create a network channel
+        let (tx, rx) = mpsc::channel(10);
+
+        for server_index in 0..node_num {
+            // Create client in every server
+            let mut clients = Vec::with_capacity(node_num);
+            for client_index in 0..node_num {
+                // Create client
+                let client = Client::new(
+                    format!("client_{}_on_server_{}", client_index, server_index),
+                    tx.clone(),
+                );
+                clients.push(TestRaftClient {
+                    client: client.clone(),
+                });
+
+                // add connection
+                network.connect(client.name(), &format!("server_{}", client_index));
+            }
+
+            // Create server and add to network
+            let server = create_raft_server(clients.clone(), server_index);
+            network.add_server(server.clone());
+        }
+
+        (network, rx)
     }
 }

@@ -1,5 +1,5 @@
 #[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
-enum Role {
+pub enum Role {
     #[default]
     Follower,
     Candidate,
@@ -72,6 +72,11 @@ impl State {
     #[inline]
     pub fn is_leader(&self) -> bool {
         matches!(self.role, Role::Leader)
+    }
+
+    #[inline]
+    pub fn role(&self) -> Role {
+        self.role
     }
 
     #[inline]
