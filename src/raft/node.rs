@@ -12,9 +12,10 @@ use tokio::{
 };
 use tonic::{Request, Response, Status};
 
-pub struct RafterInner {
+// Rafter must use the raft rpc client (RaftClient)
+pub struct RafterInner<C> {
     // Manage all peers rpc client
-    peers: Vec<RaftClient>,
+    peers: Vec<C>,
 
     // State of this node
     state: Arc<Mutex<State>>,
@@ -23,8 +24,8 @@ pub struct RafterInner {
     election_instant: Instant,
 }
 
-impl RafterInner {
-    fn new(peers: Vec<RaftClient>, me: usize) -> Self {
+impl<C: RaftClient> RafterInner<C> {
+    fn new(peers: Vec<C>, me: usize) -> Self {
         let peers_count = peers.len();
         RafterInner {
             peers,
@@ -76,7 +77,6 @@ impl RafterInner {
             let mut voted = 1;
 
             while let Some(Ok(vote_reply)) = rx.recv().await {
-                let vote_reply = vote_reply.get_ref();
                 if vote_reply.term == current_term && vote_reply.vote_granted {
                     voted += 1;
                     if voted > voted_threshold {
@@ -120,7 +120,7 @@ impl RafterInner {
         let leader_id = state.me();
         for (node_id, peer) in self.peers.iter().enumerate() {
             if node_id != leader_id {
-                let mut peer = peer.clone();
+                let mut peer = (*peer).clone();
                 let args = AppendEntriesArgs {
                     term: current_term,
                     leader_id: leader_id as u64,
@@ -141,7 +141,7 @@ impl RafterInner {
         let state = Arc::clone(&self.state);
         tokio::spawn(async move {
             while let Some(Ok(heartbeat_reply)) = rx.recv().await {
-                let heartbeat_reply = heartbeat_reply.get_ref();
+                let heartbeat_reply = heartbeat_reply;
                 if heartbeat_reply.term > current_term {
                     // New term and new election was coming, give up being a leader.
                     state
@@ -241,12 +241,12 @@ impl RafterInner {
 }
 
 // Implementation for Raft algorithm
-pub struct Rafter {
-    inner: Arc<Mutex<RafterInner>>,
+pub struct Rafter<C> {
+    inner: Arc<Mutex<RafterInner<C>>>,
 }
 
-impl Rafter {
-    pub fn new(peers: Vec<RaftClient>, me_index: usize) -> Self {
+impl<C: RaftClient> Rafter<C> {
+    pub fn new(peers: Vec<C>, me_index: usize) -> Self {
         let raft = Rafter {
             inner: Arc::new(Mutex::new(RafterInner::new(peers, me_index))),
         };
@@ -289,7 +289,7 @@ impl Rafter {
 }
 
 #[tonic::async_trait]
-impl Raft for Rafter {
+impl<C: RaftClient> Raft for Rafter<C> {
     // Implement server side of request-vote rpc for raft
     async fn request_vote(
         &self,
