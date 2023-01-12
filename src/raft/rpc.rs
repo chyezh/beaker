@@ -5,6 +5,7 @@ pub use raftrpc::{
 };
 use tonic::async_trait;
 
+// Client used to call rpc to peers for every raft node
 #[async_trait]
 pub trait RaftClient: Clone + Send + Sync + 'static {
     // Request vote rpc
@@ -14,6 +15,7 @@ pub trait RaftClient: Clone + Send + Sync + 'static {
     async fn append_entries(&mut self, request: AppendEntriesArgs) -> Result<AppendEntriesReply>;
 }
 
+// Use tonic rpc library to implement raft rpc client
 #[derive(Clone)]
 pub struct TonicRaftClient(raftrpc::raft_client::RaftClient<tonic::transport::Channel>);
 

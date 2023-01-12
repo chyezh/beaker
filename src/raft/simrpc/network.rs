@@ -63,7 +63,7 @@ impl Network {
                 status: Mutex::new(NetworkStatus {
                     delay_upper_bound_ms: 40,
                     delay_lower_bound_ms: 20,
-                    packet_loss_permillage: 50,
+                    packet_loss_permillage: 10,
                 }),
                 endpoints: Mutex::new(Endpoints {
                     servers: HashMap::new(),

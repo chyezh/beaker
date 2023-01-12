@@ -1,16 +1,16 @@
-use super::rpc::*;
 use super::state::State;
-use super::{Error, Result};
+use super::{
+    event::{Event, EventHandler},
+    rpc::*,
+};
 use rand::Rng;
+use std::io::IntoInnerError;
 use std::{
     ops::Add,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{
-    sync::mpsc::channel,
-    time::{self, Instant},
-};
+use tokio::time::{self, Instant};
 use tonic::{Request, Response, Status};
 
 // Rafter must use the raft rpc client (RaftClient)
@@ -19,9 +19,9 @@ pub struct RafterInner<C> {
     peers: Vec<C>,
 
     // State of this node
-    state: Arc<Mutex<State>>,
+    state: State,
 
-    // next triggering election time
+    // Next election time instant
     election_instant: Instant,
 }
 
@@ -30,139 +30,51 @@ impl<C: RaftClient> RafterInner<C> {
         let peers_count = peers.len();
         RafterInner {
             peers,
-            state: Arc::new(Mutex::new(State::new(peers_count, me))),
+            state: State::new(peers_count, me),
             election_instant: Instant::now(),
         }
     }
 
-    // Try to start a new election
-    fn trigger_election(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        // Leader always don't trigger election.
-        if state.is_leader() {
-            return;
+    // Prepare to do a election
+    pub fn prepare_election(&mut self) -> Option<(Vec<C>, State)> {
+        // Leader always don't trigger election
+        if self.state.is_leader() {
+            return None;
         }
 
         // Set as candidate and vote for myself
-        state.set_as_candidate();
-        let current_term = state.term();
-        let me = state.me();
+        self.state.set_as_candidate();
 
-        // Send request to all peers except this node
-        let (tx, mut rx) = channel(self.peers.len() - 1);
-        for (node_id, peer) in self.peers.iter().enumerate() {
-            if node_id != me {
-                let mut peer = peer.clone();
-                let tx = tx.clone();
-
-                let args = RequestVoteArgs {
-                    term: current_term,
-                    candidate_id: me as u64,
-                    // TODO: check last log index
-                    last_log_index: 0,
-                    last_log_term: 0,
-                };
-
-                tokio::spawn(async move {
-                    let vote_reply = peer.request_vote(args).await;
-                    tx.send(vote_reply).await.ok();
-                });
-            }
-        }
-
-        // Async receiving the vote reply, and handle the election
-        let voted_threshold = self.peers.len() / 2;
-        let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
-            // Candidates always voted for myself
-            let mut voted = 1;
-
-            while let Some(Ok(vote_reply)) = rx.recv().await {
-                if vote_reply.term == current_term && vote_reply.vote_granted {
-                    voted += 1;
-                    if voted > voted_threshold {
-                        // Quorum of peers voted for this node, break to set this node as leader
-                        break;
-                    }
-                } else if current_term < vote_reply.term {
-                    // Find a new term
-                    // Set this node into a follower, give up election process in this term
-                    state
-                        .lock()
-                        .unwrap()
-                        .set_as_follower_in_new_term(vote_reply.term);
-                    return;
-                }
-            }
-
-            if voted > voted_threshold {
-                // Election success, set this peer as leader if current term is not changed
-                state
-                    .lock()
-                    .unwrap()
-                    .set_as_leader_in_this_term(current_term);
-            }
-        });
-
-        // Release the lock for current node's state by RAII
+        // Return election-needed information
+        Some((self.peers.clone(), self.state.clone()))
     }
 
-    fn trigger_heartbeat(&self) {
-        let state = self.state.lock().unwrap();
-
-        // Only leader trigger a heartbeat test
-        if !state.is_leader() {
-            return;
+    // Prepare to do a heartbeat
+    pub fn prepare_heartbeat(&self) -> Option<(Vec<C>, State)> {
+        // Only leader trigger a heartbeat
+        if !self.state.is_leader() {
+            return None;
         }
 
-        // Sending heartbeat test to every follower
-        let (tx, mut rx) = channel(self.peers.len() - 1);
-        let current_term = state.term();
-        let leader_id = state.me();
-        for (node_id, peer) in self.peers.iter().enumerate() {
-            if node_id != leader_id {
-                let mut peer = (*peer).clone();
-                let args = AppendEntriesArgs {
-                    term: current_term,
-                    leader_id: leader_id as u64,
-                    // TODO: fill other field
-                    prev_log_index: 0,
-                    prev_log_term: 0,
-                    leader_commit: 0,
-                    entries: 0,
-                };
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let heartbeat_reply = peer.append_entries(args).await;
-                    tx.send(heartbeat_reply).await.ok();
-                });
-            }
-        }
+        // Return heartbeat-needed information
+        Some((self.peers.clone(), self.state.clone()))
+    }
 
-        let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
-            while let Some(Ok(heartbeat_reply)) = rx.recv().await {
-                let heartbeat_reply = heartbeat_reply;
-                if heartbeat_reply.term > current_term {
-                    // New term and new election was coming, give up being a leader.
-                    state
-                        .lock()
-                        .unwrap()
-                        .set_as_follower_in_new_term(heartbeat_reply.term);
-                    // No need to do remaining heartbeat test
-                    return;
-                }
-            }
-        });
+    // Set this node as follower
+    #[inline]
+    pub fn set_as_follower_in_new_term(&mut self, term: u64) -> bool {
+        self.state.set_as_follower_in_new_term(term)
+    }
+
+    // Set this node as leader
+    #[inline]
+    pub fn set_as_leader_in_this_term(&mut self, term: u64) -> bool {
+        self.state.set_as_leader_in_this_term(term)
     }
 
     // Implement server side of request vote rpc
-    fn vote(&mut self, args: &RequestVoteArgs) -> RequestVoteReply {
-        // refresh election timer
-        self.refresh_election_instant();
-
-        let mut state = self.state.lock().unwrap();
-        let current_term = state.term();
+    fn request_vote(&mut self, args: &RequestVoteArgs) -> RequestVoteReply {
+        let current_term = self.state.term();
         if args.term < current_term {
             // Request vote rpc's term is out of date
             return RequestVoteReply {
@@ -171,13 +83,16 @@ impl<C: RaftClient> RafterInner<C> {
             };
         }
 
+        // Refresh election timer
+        self.force_refresh_election_instant();
+
         if args.term == current_term {
             // Vote in current term, every node should vote only once time
-            match state.voted_for() {
+            match self.state.voted_for() {
                 Some(id) if id == args.candidate_id as usize => {
                     // Already vote for this candidate in current term
                     // Maybe request was duplicated because of network problem
-                    state.set_as_follower_in_new_term(args.term);
+                    self.state.set_as_follower_in_new_term(args.term);
                     RequestVoteReply {
                         term: current_term,
                         vote_granted: true,
@@ -185,8 +100,8 @@ impl<C: RaftClient> RafterInner<C> {
                 }
                 None => {
                     // May never hit in normal implementation
-                    state.set_as_follower_in_new_term(args.term);
-                    state.vote_for(args.candidate_id);
+                    self.state.set_as_follower_in_new_term(args.term);
+                    self.state.vote_for(args.candidate_id);
                     RequestVoteReply {
                         term: current_term,
                         vote_granted: true,
@@ -199,8 +114,8 @@ impl<C: RaftClient> RafterInner<C> {
             }
         } else {
             // New term is coming, vote following first-come-first-served basis
-            state.set_as_follower_in_new_term(args.term);
-            state.vote_for(args.candidate_id);
+            self.state.set_as_follower_in_new_term(args.term);
+            self.state.vote_for(args.candidate_id);
             RequestVoteReply {
                 term: args.term,
                 vote_granted: true,
@@ -210,11 +125,7 @@ impl<C: RaftClient> RafterInner<C> {
 
     // Implement server side of append-entries rpc
     fn append_entries(&mut self, args: &AppendEntriesArgs) -> AppendEntriesReply {
-        // Refresh election timer
-        self.refresh_election_instant();
-
-        let mut state = self.state.lock().unwrap();
-        let current_term = state.term();
+        let current_term = self.state.term();
         if args.term < current_term {
             return AppendEntriesReply {
                 term: current_term,
@@ -223,7 +134,12 @@ impl<C: RaftClient> RafterInner<C> {
         }
 
         // Set as follower if new term is coming
-        state.set_as_follower_in_new_term(args.term);
+        self.state.set_as_follower_in_new_term(args.term);
+
+        println!("{:?}, {}", self.state, args.term);
+
+        // Refresh election timer if receive append entries or heartbeat
+        self.force_refresh_election_instant();
 
         AppendEntriesReply {
             term: current_term,
@@ -233,62 +149,97 @@ impl<C: RaftClient> RafterInner<C> {
 
     // Refresh election instant
     #[inline]
-    fn refresh_election_instant(&mut self) {
+    fn refresh_election_instant(&mut self) -> (Instant, bool) {
+        // TODO: configure for election instant refresh range
+        let now = Instant::now();
+        if self.election_instant < now {
+            (self.force_refresh_election_instant(), true)
+        } else {
+            (self.election_instant, false)
+        }
+    }
+
+    // Refresh election instant
+    #[inline]
+    fn force_refresh_election_instant(&mut self) -> Instant {
         // TODO: configure for election instant refresh range
         self.election_instant = Instant::now().add(Duration::from_millis(
             rand::thread_rng().gen_range(150..=300),
         ));
+        self.election_instant
     }
 }
 
 #[derive(Clone)]
 // Implementation for Raft algorithm
 pub struct Rafter<C> {
+    // TODO: Lock optimization
+    // Raft node inner state
     inner: Arc<Mutex<RafterInner<C>>>,
+    // Raft event handler
+    event_handler: EventHandler<C>,
+    // election timeout
+    election_instant: Arc<Mutex<Instant>>,
 }
 
 impl<C: RaftClient> Rafter<C> {
+    // Create a new Rafter
     pub fn new(peers: Vec<C>, me_index: usize) -> Self {
-        let raft = Rafter {
-            inner: Arc::new(Mutex::new(RafterInner::new(peers, me_index))),
+        let inner = Arc::new(Mutex::new(RafterInner::new(peers, me_index)));
+        let event_handler = EventHandler::new(Arc::clone(&inner));
+
+        let rf = Rafter {
+            inner,
+            event_handler,
+            election_instant: Arc::new(Mutex::new(Instant::now())),
         };
 
-        raft.start_election_task();
-        raft.start_heartbeat_task();
-        raft
+        rf.start_election_timed_task();
+        rf.start_heartbeat_period_task();
+
+        rf
     }
 
-    fn start_election_task(&self) {
-        let raft = Arc::clone(&self.inner);
-        raft.lock().unwrap().refresh_election_instant();
-
+    // Start election timed task
+    fn start_election_timed_task(&self) {
+        let inner = Arc::clone(&self.inner);
+        let event_channel = self.event_handler.clone_channel();
         tokio::spawn(async move {
+            // Sleep until next election time instant
+            inner.lock().unwrap().force_refresh_election_instant();
             loop {
-                // Sleep until next election time instant and check the instant again
-                let next_election_instatnt = raft.lock().unwrap().election_instant;
-                if next_election_instatnt < Instant::now() {
-                    raft.lock().unwrap().trigger_election();
-                    raft.lock().unwrap().refresh_election_instant();
+                let (next_election_instant, refresh) =
+                    inner.lock().unwrap().refresh_election_instant();
+
+                if refresh {
+                    // Start a new election event if reaching next election time
+                    // Send operation would never failed
+                    event_channel.send(Event::Election).unwrap();
                 }
-                time::sleep_until(next_election_instatnt).await;
+
+                // sleep util next election instant
+                time::sleep_until(next_election_instant).await;
             }
         });
     }
 
-    fn start_heartbeat_task(&self) {
-        let raft = Arc::clone(&self.inner);
+    // Start heartbeat period task
+    fn start_heartbeat_period_task(&self) {
+        let event_channel = self.event_handler.clone_channel();
         tokio::spawn(async move {
-            // TODO: should configurable
+            // TODO: should be configurable
             let mut interval = time::interval(Duration::from_millis(100));
             loop {
                 // Send heartbeat periodically
+                // Send operation would never failed
                 interval.tick().await;
-                raft.lock().unwrap().trigger_heartbeat();
+                event_channel.send(Event::Heartbeat).unwrap();
             }
         });
     }
 }
 
+// Use tonic rpc library to implement raft rpc server
 #[tonic::async_trait]
 impl<C: RaftClient> Raft for Rafter<C> {
     // Implement server side of request-vote rpc for raft
@@ -298,7 +249,7 @@ impl<C: RaftClient> Raft for Rafter<C> {
     ) -> std::result::Result<Response<RequestVoteReply>, Status> {
         // TODO: Lock optimize
         Ok(Response::new(
-            self.inner.lock().unwrap().vote(request.get_ref()),
+            self.inner.lock().unwrap().request_vote(request.get_ref()),
         ))
     }
 
@@ -319,9 +270,12 @@ mod test {
     const APPEND_ENTRIES_SERVICE_NAME: &str = "append_entries";
 
     use super::{
-        super::rpc::RaftClient,
-        super::simrpc::{Client, Network, Request, Server, ServerBuilder, Service, TestError},
-        AppendEntriesArgs, AppendEntriesReply, Rafter, RequestVoteArgs, RequestVoteReply, Result,
+        super::{
+            rpc::RaftClient,
+            simrpc::{Client, Network, Request, Server, ServerBuilder, Service, TestError},
+            Result,
+        },
+        AppendEntriesArgs, AppendEntriesReply, Rafter, RequestVoteArgs, RequestVoteReply,
     };
     use prost::Message;
     use tokio::sync::mpsc;
@@ -340,6 +294,7 @@ mod test {
         runtime.block_on(async move { network.start(channel).await });
     }
 
+    // Implement simulation environment for testing
     #[derive(Clone)]
     struct TestRaftClient {
         client: Client,
@@ -386,7 +341,7 @@ mod test {
         async fn handle(&self, data: &[u8]) -> Result<Vec<u8>> {
             let request =
                 RequestVoteArgs::decode(data).map_err(|_| TestError::SerializationFailed)?;
-            let response = self.0.inner.lock().unwrap().vote(&request);
+            let response = self.0.inner.lock().unwrap().request_vote(&request);
             Ok(response.encode_to_vec())
         }
     }
@@ -411,7 +366,7 @@ mod test {
         );
         server.add_service(
             APPEND_ENTRIES_SERVICE_NAME.to_string(),
-            Box::new(RequestVoteService(rafter)),
+            Box::new(AppendEntriesService(rafter)),
         );
         server.build()
     }

@@ -1,3 +1,4 @@
+// Role of raft node
 #[derive(Default, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Role {
     #[default]
@@ -6,6 +7,7 @@ pub enum Role {
     Leader,
 }
 
+// State of raft peer node
 #[derive(Debug, Clone)]
 struct Peer {
     // Index of the next log entry to send to that server
@@ -17,7 +19,8 @@ struct Peer {
     match_index: u64,
 }
 
-#[derive(Debug)]
+// State of raft node, implement all state transform operations
+#[derive(Debug, Clone)]
 pub struct State {
     // Role of this node
     role: Role,
@@ -86,18 +89,24 @@ impl State {
 
     // Perform a CAS, set this node as leader, if term is matched.
     #[inline]
-    pub fn set_as_leader_in_this_term(&mut self, term: u64) {
+    pub fn set_as_leader_in_this_term(&mut self, term: u64) -> bool {
         if self.current_term == term {
             self.role = Role::Leader;
+            true
+        } else {
+            false
         }
     }
 
     // Set this node as follower and update the term if term is gte than current term
     #[inline]
-    pub fn set_as_follower_in_new_term(&mut self, term: u64) {
+    pub fn set_as_follower_in_new_term(&mut self, term: u64) -> bool {
         if term >= self.current_term {
             self.current_term = term;
             self.role = Role::Follower;
+            true
+        } else {
+            false
         }
     }
 

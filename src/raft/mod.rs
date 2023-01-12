@@ -4,6 +4,8 @@ mod rpc;
 
 mod state;
 
+mod event;
+
 mod error;
 pub use error::Error;
 
