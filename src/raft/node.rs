@@ -4,7 +4,6 @@ use super::{
     rpc::*,
 };
 use rand::Rng;
-use std::io::IntoInnerError;
 use std::{
     ops::Add,
     sync::{Arc, Mutex},
@@ -135,8 +134,6 @@ impl<C: RaftClient> RafterInner<C> {
 
         // Set as follower if new term is coming
         self.state.set_as_follower_in_new_term(args.term);
-
-        println!("{:?}, {}", self.state, args.term);
 
         // Refresh election timer if receive append entries or heartbeat
         self.force_refresh_election_instant();

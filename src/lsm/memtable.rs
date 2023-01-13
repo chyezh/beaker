@@ -97,7 +97,7 @@ impl PersistentMemTable {
 
         // split log, creator a new log to write
         if log_writer.written() > SPLIT_LOG_SIZE_THRESHOLD {
-            self.open_new_log();
+            self.open_new_log()?;
         }
 
         Ok(())

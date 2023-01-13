@@ -1,5 +1,11 @@
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("io")]
+    Io {
+        #[from]
+        source: std::io::Error,
+    },
+
     #[error("tonic status")]
     TonicStatus {
         #[from]
@@ -11,6 +17,12 @@ pub enum Error {
         #[from]
         source: tonic::transport::Error,
     },
+
+    #[error("illegal log record")]
+    IllegalLogRecord,
+
+    #[error("illegal log")]
+    IllegalLog,
 
     #[cfg(test)]
     #[error("test error")]
