@@ -10,8 +10,6 @@ mod log;
 mod block;
 mod table;
 
-mod util;
-
 // Module result type
 pub type Result<T> = std::result::Result<T, Error>;
 

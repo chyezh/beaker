@@ -7,12 +7,9 @@
 //    type: uint8          // One of FULL, FIRST, MIDDLE, LAST
 //    data: uint8[length]
 
-use crate::engine::lsm::util::from_le_bytes_32;
+use crate::util::{checksum, from_le_bytes_32, read_exact};
 
-use super::{
-    util::{checksum, read_exact},
-    Error, Result,
-};
+use super::{Error, Result};
 use std::io::{Cursor, Read, Write};
 
 use bytes::Buf;

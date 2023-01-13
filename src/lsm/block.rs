@@ -1,6 +1,5 @@
-use super::util::from_le_bytes_32;
 use super::{Error, Result};
-use std::marker::PhantomData;
+use crate::util::from_le_bytes_32;
 use std::{cmp::Ordering, mem::size_of};
 
 const KEY_PREFIX_COMPRESS_RESTART_THRESHOLD: usize = 15;
@@ -320,7 +319,7 @@ impl<'a> Iterator for BlockIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::lsm::util::generate_random_bytes_vec;
+    use crate::util::generate_random_bytes_vec;
 
     #[test]
     fn test_block_build_and_search_with_random_case() {

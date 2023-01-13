@@ -1,8 +1,7 @@
-use crate::engine::lsm::util::{from_le_bytes_32, from_le_bytes_64};
+use crate::util::{checksum, from_le_bytes_32, from_le_bytes_64, seek_and_read_buf};
 
 use super::{
     block::{Block, BlockBuilder, BlockIntoIterator},
-    util::{checksum, seek_and_read_buf},
     Error, Result,
 };
 use std::{
@@ -191,7 +190,7 @@ impl<R: Seek + Read> Iterator for TableIntoIterator<R> {
                             block_info.size,
                         );
                         if block_buffer.is_err() {
-                            self.err = block_buffer.err();
+                            self.err = block_buffer.err().map(Error::from);
                             return None;
                         }
                         let block_buffer = block_buffer.unwrap();
@@ -446,7 +445,7 @@ impl<W: Write> TableBuilder<W> {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::lsm::util::generate_random_bytes_vec;
+    use crate::util::generate_random_bytes_vec;
 
     use super::*;
     use std::{collections::HashMap, io::Cursor};

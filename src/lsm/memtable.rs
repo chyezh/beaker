@@ -1,6 +1,7 @@
+use crate::util::from_le_bytes_32;
+
 use super::{
     log::{RecordReader, RecordWriter},
-    util::from_le_bytes_32,
     Error, Key, Result, Value,
 };
 use std::collections::BTreeMap;
@@ -255,7 +256,7 @@ impl MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::lsm::util::generate_random_bytes_vec;
+    use crate::util::generate_random_bytes_vec;
 
     #[test]
     fn test_log_with_random_case() {
