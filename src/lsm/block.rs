@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 use super::{Error, Result};
 use crate::util::from_le_bytes_32;
 use std::{cmp::Ordering, mem::size_of};
@@ -82,7 +84,7 @@ impl BlockBuilder {
 
         // build kv field
         self.buffer.extend_from_slice(&key[shared_prefix_count..]);
-        self.buffer.extend_from_slice(value);
+        self.buffer.extend_from_slice(&value);
 
         self.last_key.resize(shared_prefix_count, b'\x00');
         self.last_key.extend_from_slice(&key[shared_prefix_count..]);
@@ -92,13 +94,13 @@ impl BlockBuilder {
 }
 
 pub struct Block {
-    data: Vec<u8>, // Original block binary data
+    data: Bytes, // Original block binary data
     compress_restart_offset: Vec<usize>,
 }
 
 impl Block {
     // Construct a new block from bytes builded by BlockBuilder
-    pub fn from_bytes(mut data: Vec<u8>) -> Result<Self> {
+    pub fn from_bytes(data: Bytes) -> Result<Self> {
         let data_size = data.len();
 
         // Store size of restart offset array at least
@@ -121,7 +123,7 @@ impl Block {
         }
 
         // resize to data block
-        data.resize(restart_offset_start, b'\x00');
+        let data = data.slice(0..restart_offset_start);
 
         Ok(Block {
             data,
@@ -129,45 +131,44 @@ impl Block {
         })
     }
 
-    pub fn into_iter<'a>(self) -> BlockIntoIterator {
+    // Transform into iterator
+    pub fn into_iter(self) -> BlockIntoIterator {
         BlockIntoIterator {
             data: self.data,
-            data_offset_idx: 0,
             compress_restart_offset: self.compress_restart_offset,
-            last_key: Vec::new(),
+            last_key: Vec::with_capacity(128),
             counter: 0,
             restart_offset_idx: 0,
-            err: None,
         }
     }
 
-    // Create a new iterator on this block
+    // Create a new iterator
     pub fn iter(&self) -> BlockIterator {
         BlockIterator {
+            data: self.data.clone(),
             last_key: Vec::with_capacity(128),
             compress_restart_offset: &self.compress_restart_offset,
-            data: &self.data,
             counter: 0,
             restart_offset_idx: 0,
-            err: None,
         }
     }
 
     // Search a key in this block, block items is assumed to be sorted in lexicographic order
-    pub fn search_key(&self, key: &[u8]) -> Option<&[u8]> {
-        for (current_key, value) in self.iter() {
+    pub fn search_key(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        for pair in self.iter() {
+            let (current_key, value) = pair?;
             match (&current_key[..]).cmp(key) {
-                Ordering::Equal => return Some(value),
+                Ordering::Equal => return Ok(Some(value)),
                 // KV Items are sorted, return None immediately if current key is lexicographic greater than target key
-                Ordering::Greater => return None,
+                Ordering::Greater => return Ok(None),
                 _ => continue,
             }
         }
-        None
+        Ok(None)
     }
 
     // Parse new KV, return the shared_prefix_count, non_shared_key, value and rest data
-    fn parse_new_kv(data: &[u8]) -> Result<(usize, &[u8], &[u8], usize)> {
+    fn parse_new_kv(data: &Bytes) -> Result<(usize, Bytes, Bytes, Bytes)> {
         // Check single item header,
         // 12 bytes, shared_prefix_count, non_shared_prefix_count, value_length
         debug_assert!(data.len() > 12);
@@ -187,97 +188,31 @@ impl Block {
             return Err(Error::BadSSTableBlock);
         }
 
+        let key = data.slice(key_offset..value_offset);
+        let value = data.slice(value_offset..next_data_offset);
+
         Ok((
             shared_prefix_count,
-            &data[key_offset..value_offset],
-            &data[value_offset..next_data_offset],
-            next_data_offset,
+            key,
+            value,
+            data.slice(next_data_offset..),
         ))
     }
 }
 
+// Block into iterator implement
 pub struct BlockIntoIterator {
-    data: Vec<u8>,
-    data_offset_idx: usize,
+    data: Bytes,
     compress_restart_offset: Vec<usize>,
     last_key: Vec<u8>,
     counter: usize,
     restart_offset_idx: usize,
-    err: Option<Error>,
-}
-
-impl BlockIntoIterator {
-    // Get error and drop the target
-    fn error(mut self) -> Option<Error> {
-        std::mem::replace(&mut self.err, None)
-    }
 }
 
 impl Iterator for BlockIntoIterator {
-    type Item = (Vec<u8>, Vec<u8>);
+    type Item = Result<(Bytes, Bytes)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        debug_assert!(matches!(self.err, None));
-        if self.data_offset_idx == self.data.len() {
-            return None;
-        }
-
-        // Check restart offset and clear the last key
-        if self.restart_offset_idx < self.compress_restart_offset.len()
-            && self.compress_restart_offset[self.restart_offset_idx] == self.counter
-        {
-            self.last_key.clear();
-            self.restart_offset_idx += 1;
-        }
-
-        // parse single kv pair
-        match Block::parse_new_kv(&self.data[self.data_offset_idx..]) {
-            Ok((shared_prefix_count, non_shared_key, value, next_offset)) => {
-                // Advance state
-                self.last_key.resize(shared_prefix_count, b'\x00');
-                self.last_key.extend_from_slice(non_shared_key);
-                self.counter += 1;
-                self.data_offset_idx += next_offset;
-
-                let key = self.last_key[..shared_prefix_count]
-                    .iter()
-                    .chain(non_shared_key)
-                    .copied()
-                    .collect();
-
-                Some((key, value.to_vec()))
-            }
-            Err(e) => {
-                // Error happened, stop iteration
-                self.err = Some(e);
-                None
-            }
-        }
-    }
-}
-
-// Block iteration implement
-pub struct BlockIterator<'a> {
-    data: &'a [u8],
-    compress_restart_offset: &'a [usize],
-    last_key: Vec<u8>,
-    counter: usize,
-    restart_offset_idx: usize,
-    err: Option<Error>,
-}
-
-impl<'a> BlockIterator<'a> {
-    // Get error and drop the target
-    fn error(self) -> Option<Error> {
-        self.err
-    }
-}
-
-impl<'a> Iterator for BlockIterator<'a> {
-    type Item = (Vec<u8>, &'a [u8]);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        debug_assert!(matches!(self.err, None));
         if self.data.is_empty() {
             return None;
         }
@@ -291,26 +226,75 @@ impl<'a> Iterator for BlockIterator<'a> {
         }
 
         // parse single kv pair
-        match Block::parse_new_kv(self.data) {
-            Ok((shared_prefix_count, non_shared_key, value, next_offset)) => {
+        match Block::parse_new_kv(&self.data) {
+            Ok((shared_prefix_count, non_shared_key, value, rest_data)) => {
                 // Advance state
                 self.last_key.resize(shared_prefix_count, b'\x00');
-                self.last_key.extend_from_slice(non_shared_key);
+                self.last_key.extend_from_slice(&non_shared_key);
                 self.counter += 1;
-                self.data = &self.data[next_offset..];
-
+                self.data = rest_data;
                 let key = self.last_key[..shared_prefix_count]
                     .iter()
-                    .chain(non_shared_key)
+                    .chain(non_shared_key.iter())
                     .copied()
                     .collect();
 
-                Some((key, value))
+                Some(Ok((key, value)))
             }
             Err(e) => {
                 // Error happened, stop iteration
-                self.err = Some(e);
-                None
+                self.data = Bytes::new();
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+// Block iteration implement
+pub struct BlockIterator<'a> {
+    data: Bytes,
+    compress_restart_offset: &'a [usize],
+    last_key: Vec<u8>,
+    counter: usize,
+    restart_offset_idx: usize,
+}
+
+impl<'a> Iterator for BlockIterator<'a> {
+    type Item = Result<(Bytes, Bytes)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.data.is_empty() {
+            return None;
+        }
+
+        // Check restart offset and clear the last key
+        if self.restart_offset_idx < self.compress_restart_offset.len()
+            && self.compress_restart_offset[self.restart_offset_idx] == self.counter
+        {
+            self.last_key.clear();
+            self.restart_offset_idx += 1;
+        }
+
+        // parse single kv pair
+        match Block::parse_new_kv(&self.data) {
+            Ok((shared_prefix_count, non_shared_key, value, rest_data)) => {
+                // Advance state
+                self.last_key.resize(shared_prefix_count, b'\x00');
+                self.last_key.extend_from_slice(&non_shared_key);
+                self.counter += 1;
+                self.data = rest_data;
+                let key = self.last_key[..shared_prefix_count]
+                    .iter()
+                    .chain(non_shared_key.iter())
+                    .copied()
+                    .collect();
+
+                Some(Ok((key, value)))
+            }
+            Err(e) => {
+                // Error happened, stop iteration
+                self.data = Bytes::new();
+                Some(Err(e))
             }
         }
     }
@@ -319,14 +303,14 @@ impl<'a> Iterator for BlockIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::generate_random_bytes_vec;
+    use crate::util::generate_random_bytes;
 
     #[test]
     fn test_block_build_and_search_with_random_case() {
         // Generate random test key
         let test_count = 1000;
-        let mut test_case_key = generate_random_bytes_vec(test_count, 10000);
-        let test_case_value = generate_random_bytes_vec(test_count, 10 * 32 * 1024);
+        let mut test_case_key = generate_random_bytes(test_count, 10000);
+        let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
         test_case_key.sort();
 
         // build the table
@@ -337,9 +321,9 @@ mod tests {
         let data = builder.finish();
 
         // test search operation
-        let block = Block::from_bytes(data.to_vec()).unwrap();
+        let block = Block::from_bytes(Bytes::copy_from_slice(data)).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            assert_eq!(&block.search_key(key).unwrap(), value);
+            assert_eq!(block.search_key(key).unwrap().unwrap(), *value);
         }
     }
 
@@ -354,23 +338,36 @@ mod tests {
         builder.add(b"3", b"3");
         builder.add(b"4", b"");
         let data = builder.finish();
-        let block = Block::from_bytes(data.to_vec()).unwrap();
-        assert_eq!(block.search_key(b"123456789"), Some(b"1234567689".as_ref()));
-        assert_eq!(block.search_key(b"2"), Some(b"2".as_ref()));
-        assert_eq!(block.search_key(b"3"), Some(b"3".as_ref()));
-        assert_eq!(block.search_key(b"4"), Some(b"".as_ref()));
-        assert_eq!(block.search_key(b"5"), None);
+
+        let block = Block::from_bytes(Bytes::copy_from_slice(data)).unwrap();
         assert_eq!(
-            block.search_key(b"1234567891"),
-            Some(b"1234567689".as_ref())
+            block.search_key(b"123456789").unwrap(),
+            Some(Bytes::from_static(b"1234567689"))
         );
         assert_eq!(
-            block.search_key(b"12345678912"),
-            Some(b"1234567689".as_ref())
+            block.search_key(b"2").unwrap(),
+            Some(Bytes::from_static(b"2"))
         );
         assert_eq!(
-            block.search_key(b"12345678923"),
-            Some(b"1234567689".as_ref())
+            block.search_key(b"3").unwrap(),
+            Some(Bytes::from_static(b"3"))
+        );
+        assert_eq!(
+            block.search_key(b"4").unwrap(),
+            Some(Bytes::from_static(b""))
+        );
+        assert_eq!(block.search_key(b"5").unwrap(), None);
+        assert_eq!(
+            block.search_key(b"1234567891").unwrap(),
+            Some(Bytes::from_static(b"1234567689"))
+        );
+        assert_eq!(
+            block.search_key(b"12345678912").unwrap(),
+            Some(Bytes::from_static(b"1234567689"))
+        );
+        assert_eq!(
+            block.search_key(b"12345678923").unwrap(),
+            Some(Bytes::from_static(b"1234567689"))
         );
     }
 }

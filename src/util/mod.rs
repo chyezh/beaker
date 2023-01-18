@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use crc::{Crc, CRC_32_ISCSI};
 use std::io::{Read, Seek, SeekFrom};
 
@@ -74,6 +75,21 @@ pub fn generate_random_bytes_vec(num: usize, max_len: usize) -> Vec<Vec<u8>> {
         let mut new_bytes = vec![0; size];
         rng.fill_bytes(&mut new_bytes[..]);
         v.push(new_bytes);
+    }
+    v
+}
+
+#[cfg(test)]
+pub fn generate_random_bytes(num: usize, max_len: usize) -> Vec<Bytes> {
+    use rand::{Rng, RngCore};
+
+    let mut v = Vec::with_capacity(num);
+    for _ in 0..num {
+        let mut rng = rand::thread_rng();
+        let size: usize = rng.gen_range(1..max_len);
+        let mut new_bytes = vec![0; size];
+        rng.fill_bytes(&mut new_bytes[..]);
+        v.push(Bytes::from(new_bytes));
     }
     v
 }

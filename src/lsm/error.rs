@@ -6,8 +6,11 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("illegal log record")]
-    IllegalLogRecord,
+    #[error("illegal value binary format")]
+    IllegalValueBinary,
+
+    #[error("illegal record")]
+    IllegalRecord,
 
     #[error("illegal log")]
     IllegalLog,

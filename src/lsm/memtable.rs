@@ -1,33 +1,40 @@
+use bytes::Bytes;
+
 use crate::util::from_le_bytes_32;
 
 use super::{
-    log::{RecordReader, RecordWriter},
-    Error, Key, Result, Value,
+    record::{RecordReader, RecordWriter},
+    util::Value,
+    Error, Result,
 };
-use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-const KV_LIVING_VALUE_TYPE: u8 = 1;
-const KV_TOMBSTONE_VALUE_TYPE: u8 = 0;
-const KV_LIVING_VALUE_HEADER: usize = 1 + 4 + 4; // value_type + key_length + value_length
-const KV_TOMBSTONE_VALUE_HEADER: usize = 1 + 4; // value_type + key_length
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+
+const KV_HEADER: usize = 8; // key_len + value_len 4+4
 const SPLIT_LOG_SIZE_THRESHOLD: usize = 4 * 1024 * 1024; // 4M
 const LOG_FILE_EXTENSION: &str = "log";
 
 // Implement a memtable with persist write-ahead-log file
-pub struct PersistentMemTable {
-    // Sequence of memtable and corresponding record writer
-    tables: Vec<(MemTable, Option<RecordWriter<File>>)>,
-    // persistent directory root path
+pub struct MemTable {
+    mutable: Arc<Mutex<KVTable>>,
+    immutable: Arc<RwLock<Vec<Arc<KVTable>>>>,
     root_path: PathBuf,
-    // next new log to write
-    next_log_seq: u64,
+    next_log_seq: AtomicU64,
+
+    dump_tx: UnboundedSender<DumpRequest>,
+    dump_rx: Option<UnboundedReceiver<DumpRequest>>,
+    dump_finish_tx: UnboundedSender<PathBuf>,
 }
 
-impl PersistentMemTable {
-    // Create or recover memtable with given persistent directory root path
-    pub fn create_or_recover(root_path: impl Into<PathBuf>) -> Result<Self> {
+impl MemTable {
+    pub fn open(root_path: impl Into<PathBuf>) -> Result<Self> {
         // Try to create log root directory at this path.
         let root_path: PathBuf = root_path.into();
         fs::create_dir_all(root_path.clone())?;
@@ -35,93 +42,215 @@ impl PersistentMemTable {
         // Scan the root_path directory, find all log sorted by sequence number
         let log_files = scan_sorted_file_at_path(&root_path)?;
 
-        let (tables, next_log_seq) = if !log_files.is_empty() {
-            // Read the log, recover the memtable
-            let mut tables: Vec<(MemTable, Option<RecordWriter<File>>)> =
-                Vec::with_capacity(1 + log_files.len());
+        // Create dump task channel
+        let (tx, rx) = mpsc::unbounded_channel::<DumpRequest>();
+        let (finish_tx, finish_rx) = mpsc::unbounded_channel::<PathBuf>();
+
+        // Recover immutables
+        let (immutable, mut next_log_seq) = if !log_files.is_empty() {
+            let mut tables = Vec::with_capacity(log_files.len());
+
+            // Recover immutable memtable
             for (path, _) in log_files.iter() {
-                let reader = RecordReader::new(File::open(path)?);
-                let mut table = MemTable::new();
+                let reader = RecordReader::new(File::open(path.clone())?);
+                let mut table = KVTable::new(path.clone());
                 for data in reader {
                     let (key, value) = decode_kv(data?)?;
-                    table.set(key, value);
+                    table.entries.insert(key, value);
                 }
-                // Old tables never write new entry
-                tables.push((table, None));
-            }
 
+                // Old tables never write new entry
+                let immutable_table = Arc::new(table);
+                tables.push(Arc::clone(&immutable_table));
+                // Ask to dump the immutable memtable
+                tx.send(DumpRequest::new(immutable_table, finish_tx.clone()));
+            }
             (tables, log_files.last().unwrap().1 + 1)
         } else {
-            // Empty log, set the initial params
-            let tables: Vec<(MemTable, Option<RecordWriter<File>>)> = Vec::with_capacity(2);
-            (tables, 0)
+            (Vec::new(), 0)
         };
-        let mut table = PersistentMemTable {
-            tables,
+
+        // Create new mutable to write
+        let new_log_seq = next_log_seq;
+        let (new_file, new_log_path) = open_new_log(&root_path, new_log_seq)?;
+        let mut mutable = KVTable::new(new_log_path);
+        mutable.log = Some(RecordWriter::new(new_file));
+        next_log_seq += 1;
+
+        let table = MemTable {
+            mutable: Arc::new(Mutex::new(mutable)),
+            immutable: Arc::new(RwLock::new(immutable)),
             root_path,
-            next_log_seq,
+            next_log_seq: AtomicU64::new(next_log_seq),
+            dump_tx: tx,
+            dump_rx: Some(rx),
+            dump_finish_tx: finish_tx,
         };
 
-        // Create new log to write
-        table.open_new_log()?;
-
+        // Start the memtable cleaner
+        table.start_cleaner(finish_rx);
         Ok(table)
     }
 
-    // Find a living value by key from tables sequentially.
-    // Return None immediately if any value is a tombstone
-    pub fn get(&self, key: &Key) -> Option<Vec<u8>> {
-        debug_assert!(!self.tables.is_empty() && !key.is_empty());
-        for (table, _) in self.tables.iter().rev() {
-            match table.get(key) {
-                Some(Value::Living(v)) => return Some(v),
-                Some(Value::Tombstone) => return None,
-                None => {}
+    // Take the dump request receiver
+    pub fn take_dump_listener(&mut self) -> Option<UnboundedReceiver<DumpRequest>> {
+        self.dump_rx.take()
+    }
+
+    // Get the value by key
+    pub fn get(&self, key: &Bytes) -> Option<Value> {
+        // Read mutable first
+        if let Some(value) = self.mutable.lock().unwrap().entries.get(key) {
+            return Some(value.clone());
+        }
+
+        // Read from immutable list
+        let immutable = self.immutable.read().unwrap();
+        for table in &*immutable {
+            if let Some(value) = table.entries.get(key) {
+                return Some(value.clone());
             }
         }
         None
     }
 
-    // Write record to last persistent log, set a value to the last table
-    pub fn set(&mut self, key: Key, value: Value) -> Result<()> {
-        debug_assert!(!self.tables.is_empty() && !key.is_empty());
-        // Get the last log and corresponding table
-        let (table, log_writer) = self.tables.last_mut().unwrap();
-        debug_assert!(log_writer.is_some());
-        let log_writer = log_writer.as_mut().unwrap();
+    // Set the key-value pair into mutable
+    pub fn set(&self, key: Bytes, value: Value) -> Result<()> {
+        let mut mutable = self.mutable.lock().unwrap();
+        // Mutable log must exists
+        debug_assert!(mutable.log.is_some());
 
-        // Write kv pair into log
-        log_writer.append(encode_kv(&key, &value))?;
-        // Then set it to memory table
-        table.set(key, value);
+        // Write kv pair into log ahead
+        let total_written = mutable
+            .log
+            .as_mut()
+            .unwrap()
+            .append(encode_kv(&key, &value))?;
 
-        // split log, creator a new log to write
-        if log_writer.written() > SPLIT_LOG_SIZE_THRESHOLD {
-            self.open_new_log()?;
+        // Set value into in-memory table
+        mutable.entries.insert(key, value);
+
+        // Switch new log if needed
+        // Low-rate route
+        if total_written > SPLIT_LOG_SIZE_THRESHOLD {
+            let new_log_seq = self.next_log_seq.fetch_add(1, Ordering::Relaxed);
+
+            // Create a new writer
+            let (new_file, new_log_path) = open_new_log(&self.root_path, new_log_seq)?;
+            let mut new_mutable = KVTable::new(new_log_path);
+            new_mutable.log = Some(RecordWriter::new(new_file));
+
+            // Swap mutable, close writer, and convert old mutable into immutable
+            std::mem::swap(&mut *mutable, &mut new_mutable);
+            // Close the file writer, ignore the synchronizing fail.
+            new_mutable.log.take();
+
+            let immutable = Arc::new(new_mutable);
+            // Release immutable first, read requests see new empty mutable after new immutable first.
+            // Previous write would not be lost on this read requests.
+            self.immutable.write().unwrap().push(Arc::clone(&immutable));
+
+            // Send a dump request
+            self.dump_tx
+                .send(DumpRequest::new(immutable, self.dump_finish_tx.clone()));
         }
 
         Ok(())
     }
 
-    // Open new log and increment log sequence number
-    fn open_new_log(&mut self) -> Result<()> {
-        let new_log_path = log_path(&self.root_path, self.next_log_seq);
-        let new_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(new_log_path)?;
-
-        self.next_log_seq += 1;
-        self.tables
-            .push((MemTable::new(), Some(RecordWriter::new(new_file))));
-
-        Ok(())
+    fn start_cleaner(&self, mut receiver: UnboundedReceiver<PathBuf>) {
+        let immutable = Arc::clone(&self.immutable);
+        tokio::spawn(async move {
+            // Clear log file and remove memtable if dump is finished
+            while let Some(path) = receiver.recv().await {
+                let mut tables = immutable.write().unwrap();
+                if let Some(first_table) = tables.first() {
+                    if path == first_table.path {
+                        fs::remove_file(path);
+                        tables.remove(0);
+                    }
+                }
+            }
+        });
     }
 }
 
-// Generate log path
-fn log_path(dir: &Path, log_seq: u64) -> PathBuf {
-    dir.join(format!("{}.{}", log_seq, LOG_FILE_EXTENSION))
+// Ask to do a dump operation for a slice of memtable
+pub struct DumpRequest {
+    table: Arc<KVTable>,
+    tx: UnboundedSender<PathBuf>,
+}
+
+impl DumpRequest {
+    fn new(table: Arc<KVTable>, tx: UnboundedSender<PathBuf>) -> Self {
+        DumpRequest { table, tx }
+    }
+
+    // Consume the request
+    fn ok(self) {
+        self.tx.send(self.table.path.clone());
+    }
+
+    // Get iterator of the table
+    fn iter(&self) -> impl Iterator<Item = (&Bytes, &Value)> {
+        self.table.entries.iter()
+    }
+}
+
+// Encode the KV pair into binary format. While no checksum is applied on here, record writer downside has promised. Layout:
+// 1. 0-4 key_len
+// 2. 4-8 value_len
+// 3. key
+// 4. Value::write_to
+fn encode_kv(key: &[u8], value: &Value) -> Bytes {
+    // Key length + key + value
+    let mut buffer = Vec::with_capacity(4 + key.len() + value.encode_bytes_len());
+
+    buffer.extend_from_slice(&key.len().to_le_bytes()[0..4]);
+    buffer.extend_from_slice(&value.encode_bytes_len().to_le_bytes()[0..4]);
+    buffer.extend(key);
+    // IO always success on Vec, ignore error
+    value.encode_to(&mut buffer);
+
+    buffer.into()
+}
+
+// Decode the KV Pair from binary format
+fn decode_kv(data: Bytes) -> Result<(Bytes, Value)> {
+    debug_assert!(data.len() >= KV_HEADER);
+    if data.len() < KV_HEADER {
+        return Err(Error::IllegalLog);
+    }
+
+    // Parse header
+    let key_length = from_le_bytes_32(&data[0..4]);
+    let value_length = from_le_bytes_32(&data[4..8]);
+    debug_assert_eq!(data.len(), key_length + value_length + KV_HEADER);
+    if data.len() != key_length + value_length + KV_HEADER {
+        return Err(Error::IllegalLog);
+    }
+
+    let key_offset = 8;
+    let value_offset = key_offset + key_length;
+
+    // Parse key part
+    let key = data.slice(key_offset..value_offset);
+    // Parse value part
+    let value = Value::decode_from_bytes(data.slice(value_offset..))?;
+    Ok((key, value))
+}
+
+// Open a new log with given log sequence number
+fn open_new_log(dir: &Path, log_seq: u64) -> Result<(File, PathBuf)> {
+    let new_log_path = dir.join(format!("{}.{}", log_seq, LOG_FILE_EXTENSION));
+
+    let new_file = OpenOptions::new()
+        .truncate(true)
+        .create(true)
+        .write(true)
+        .open(&new_log_path)?;
+
+    Ok((new_file, new_log_path))
 }
 
 // Scan given log root directory and get all sorted log file
@@ -149,155 +278,80 @@ fn scan_sorted_file_at_path(path: &Path) -> Result<Vec<(PathBuf, u64)>> {
     Ok(filenames)
 }
 
-// Encode the KV pair into binary format. While no checksum is applied on here, record writer downside has promised. Layout:
-// Value::Living
-// 1. 0-1 value_type
-// 2. 1-5 key_len
-// 3. 5-9 value_len
-// 4. key
-// 5. value
-// Value::Tombstone
-// 1. 0-1 value_type
-// 2. 1-5 key_len
-// 3. key
-fn encode_kv(key: &Key, value: &Value) -> Vec<u8> {
-    match value {
-        Value::Living(value) => {
-            let mut v = Vec::with_capacity(key.len() + value.len() + KV_LIVING_VALUE_HEADER);
-            // Write value_type
-            v.push(KV_LIVING_VALUE_TYPE);
-            // Write length
-            v.extend_from_slice(&key.len().to_le_bytes()[0..4]);
-            v.extend_from_slice(&value.len().to_le_bytes()[0..4]);
-            // Write data
-            v.extend_from_slice(key);
-            v.extend_from_slice(value);
-            v
-        }
-        Value::Tombstone => {
-            let mut v = Vec::with_capacity(key.len() + KV_TOMBSTONE_VALUE_HEADER);
-            v.push(KV_TOMBSTONE_VALUE_TYPE);
-            v.extend_from_slice(&key.len().to_le_bytes()[0..4]);
-            v.extend_from_slice(key);
-            v
-        }
-    }
-}
-
-// Decode the KV pair from binary format.
-fn decode_kv(v: Vec<u8>) -> Result<(Key, Value)> {
-    debug_assert!(v.len() > KV_LIVING_VALUE_HEADER || v.len() > KV_TOMBSTONE_VALUE_HEADER);
-    if v.is_empty() {
-        return Err(Error::IllegalLog);
-    }
-
-    match v[0] {
-        KV_LIVING_VALUE_TYPE => {
-            if v.len() < KV_LIVING_VALUE_HEADER {
-                return Err(Error::IllegalLog);
-            }
-            let key_length = from_le_bytes_32(&v[1..5]);
-            let value_length = from_le_bytes_32(&v[5..9]);
-            if v.len() != key_length + value_length + KV_LIVING_VALUE_HEADER {
-                return Err(Error::IllegalLog);
-            }
-            Ok((
-                (&v[KV_LIVING_VALUE_HEADER..KV_LIVING_VALUE_HEADER + key_length]).to_vec(),
-                Value::Living(Vec::from(
-                    &v[KV_LIVING_VALUE_HEADER + key_length
-                        ..KV_LIVING_VALUE_HEADER + key_length + value_length],
-                )),
-            ))
-        }
-        KV_TOMBSTONE_VALUE_TYPE => {
-            if v.len() < KV_TOMBSTONE_VALUE_HEADER {
-                return Err(Error::IllegalLog);
-            }
-            let key_length = from_le_bytes_32(&v[1..5]);
-            if v.len() != key_length + KV_TOMBSTONE_VALUE_HEADER {
-                return Err(Error::IllegalLog);
-            }
-            Ok((
-                (&v[KV_TOMBSTONE_VALUE_HEADER..KV_TOMBSTONE_VALUE_HEADER + key_length]).to_vec(),
-                Value::Tombstone,
-            ))
-        }
-        _ => Err(Error::IllegalLog),
-    }
-}
-
-// Implement memtable
+// Implement kv table
 // TODO: replace by skip list in future
-pub struct MemTable {
-    entries: BTreeMap<Key, Value>,
+struct KVTable {
+    entries: BTreeMap<Bytes, Value>,
+    log: Option<RecordWriter<File>>,
+    path: PathBuf,
 }
 
-impl MemTable {
+impl KVTable {
     // Create a new memtable
-    fn new() -> MemTable {
-        MemTable {
+    fn new(path: PathBuf) -> KVTable {
+        KVTable {
             entries: BTreeMap::default(),
+            log: None,
+            path,
         }
-    }
-
-    // Find a value by key from memtable
-    fn get(&self, key: &Key) -> Option<Value> {
-        debug_assert!(!key.is_empty());
-        self.entries.get(key).cloned()
-    }
-
-    // Set a value by key
-    fn set(&mut self, key: Key, value: Value) {
-        debug_assert!(!key.is_empty());
-        self.entries.insert(key, value);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use core::panic;
+
     use super::*;
-    use crate::util::generate_random_bytes_vec;
+    use crate::util::generate_random_bytes;
 
     #[test]
     fn test_log_with_random_case() {
         let test_count = 100;
 
-        let test_case_key = generate_random_bytes_vec(test_count, 10000);
-        let test_case_value = generate_random_bytes_vec(test_count, 10 * 32 * 1024);
+        let test_case_key = generate_random_bytes(test_count, 10000);
+        let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
 
         // Test normal value
-        let mut memtable = PersistentMemTable::create_or_recover("./data").unwrap();
+        let memtable = MemTable::open("./data").unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             memtable
-                .set(key.to_vec(), Value::Living(value.to_vec()))
+                .set(key.clone(), Value::living(value.clone()))
                 .unwrap();
         }
 
         drop(memtable);
-        let mut memtable = PersistentMemTable::create_or_recover("./data").unwrap();
+        let memtable = MemTable::open("./data").unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            assert_eq!(memtable.get(key).unwrap(), value[..]);
+            if let Some(Value::Living(v)) = memtable.get(key) {
+                assert_eq!(value, &v);
+            } else {
+                panic!("value not found or not match");
+            }
         }
 
         // Test deleted value
-        let test_case_deleted = generate_random_bytes_vec(test_count, 2);
+        let test_case_deleted = generate_random_bytes(test_count, 2);
         for (key, is_deleted) in test_case_key.iter().zip(test_case_deleted.iter()) {
             if is_deleted.first().unwrap() % 2 == 0 {
-                memtable.set(key.to_vec(), Value::Tombstone).unwrap();
+                memtable.set(key.clone(), Value::Tombstone).unwrap();
             }
         }
 
         drop(memtable);
-        let mut memtable = PersistentMemTable::create_or_recover("./data").unwrap();
+        let mut memtable = MemTable::open("./data").unwrap();
         for ((key, value), is_deleted) in test_case_key
             .iter()
             .zip(test_case_value.iter())
             .zip(test_case_deleted.iter())
         {
             if is_deleted.first().unwrap() % 2 == 0 {
-                assert!(memtable.get(key).is_none())
+                assert!(matches!(memtable.get(key).unwrap(), Value::Tombstone));
             } else {
-                assert_eq!(memtable.get(key).unwrap(), value[..]);
+                if let Some(Value::Living(v)) = memtable.get(key) {
+                    assert_eq!(value, &v);
+                } else {
+                    panic!("value not found or not match");
+                }
             }
         }
 
@@ -309,15 +363,19 @@ mod tests {
         {
             if is_deleted.first().unwrap() % 2 == 0 {
                 memtable
-                    .set(key.to_vec(), Value::Living(value.to_vec()))
+                    .set(key.clone(), Value::living(value.clone()))
                     .unwrap();
             }
         }
 
         drop(memtable);
-        let memtable = PersistentMemTable::create_or_recover("./data").unwrap();
+        let memtable = MemTable::open("./data").unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            assert_eq!(memtable.get(key).unwrap(), value[..]);
+            if let Some(Value::Living(v)) = memtable.get(key) {
+                assert_eq!(value, &v);
+            } else {
+                panic!("value not found or not match");
+            }
         }
     }
 }

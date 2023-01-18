@@ -1,7 +1,11 @@
+use bytes::Bytes;
+
 use crate::util::{checksum, from_le_bytes_32, from_le_bytes_64, seek_and_read_buf};
 
 use super::{
     block::{Block, BlockBuilder, BlockIntoIterator},
+    error,
+    util::Value,
     Error, Result,
 };
 use std::{
@@ -12,13 +16,13 @@ use std::{
 const FOOTER_SIZE: usize = 12; // 12bytes
 const BLOCK_DEFAULT_SIZE: usize = 4 * 1024; // 4kb
 
-pub struct Table<R: Seek + Read> {
+pub struct SSTable<R: Seek + Read> {
     index: Index,
     reader: R,
-    range: (Vec<u8>, Vec<u8>), // Key range of this table [xxx, xxx]
+    range: (Bytes, Bytes), // Key range of this table [xxx, xxx]
 }
 
-impl<R: Seek + Read> Table<R> {
+impl<R: Seek + Read> SSTable<R> {
     fn open(mut reader: R) -> Result<Self> {
         // Recover footer from file
         let footer_buffer = seek_and_read_buf(
@@ -47,7 +51,7 @@ impl<R: Seek + Read> Table<R> {
             return Err(Error::BadSSTable);
         }
         index_buffer.resize(index_len - 4, b'\x00');
-        let index = Index::from_block(Block::from_bytes(index_buffer)?)?;
+        let index = Index::from_block(Block::from_bytes(index_buffer.into())?)?;
 
         // Parse key range of this table
         // Get first key
@@ -67,8 +71,8 @@ impl<R: Seek + Read> Table<R> {
             return Err(Error::BadSSTable);
         }
 
-        let first_block = Block::from_bytes(block_buffer)?;
-        let (first_key, _) = first_block.iter().next().ok_or(Error::BadSSTable)?;
+        let first_block = Block::from_bytes(block_buffer.into())?;
+        let (first_key, _) = first_block.iter().next().ok_or(Error::BadSSTable)??;
         // Get last key
         let last_block = if index.index.len() == 1 {
             // Single block in index
@@ -84,22 +88,22 @@ impl<R: Seek + Read> Table<R> {
             if block_buffer.len() != last_block.size {
                 return Err(Error::BadSSTable);
             }
-            Block::from_bytes(block_buffer)?
+            Block::from_bytes(block_buffer.into())?
         };
 
-        let mut last_key = Vec::new();
-        for (k, _) in last_block.iter() {
-            last_key = k;
+        let mut last_key = Bytes::new();
+        for pair in last_block.iter() {
+            last_key = pair?.0;
         }
 
-        Ok(Table {
+        Ok(SSTable {
             index,
             reader,
             range: (first_key, last_key),
         })
     }
 
-    pub fn search_key(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn search_key(&mut self, key: &[u8]) -> Result<Option<Value>> {
         if !self.in_range(key) {
             return Ok(None);
         }
@@ -123,8 +127,8 @@ impl<R: Seek + Read> Table<R> {
             return Err(Error::BadSSTable);
         }
 
-        if let Some(value) = Block::from_bytes(block_buffer)?.search_key(key) {
-            return Ok(Some(value.to_vec()));
+        if let Some(value) = Block::from_bytes(block_buffer.into())?.search_key(key)? {
+            return Ok(Some(Value::decode_from_bytes(value)?));
         }
         Ok(None)
     }
@@ -134,152 +138,105 @@ impl<R: Seek + Read> Table<R> {
     }
 }
 
-impl<R: Read + Seek> IntoIterator for Table<R> {
-    type Item = (Vec<u8>, Vec<u8>);
-    type IntoIter = TableIntoIterator<R>;
+impl<R: Read + Seek> IntoIterator for SSTable<R> {
+    type Item = Result<(Bytes, Value)>;
+    type IntoIter = SSTableIntoIterator<R>;
 
     fn into_iter(self) -> Self::IntoIter {
-        TableIntoIterator {
+        SSTableIntoIterator {
             block: None,
             index: self.index.index.into_iter(),
             reader: self.reader,
-            err: None,
+            stop: false,
         }
     }
 }
 
-pub struct TableIntoIterator<R: Seek + Read> {
+pub struct SSTableIntoIterator<R: Seek + Read> {
     block: Option<BlockIntoIterator>,
     index: std::vec::IntoIter<BlockItem>,
     reader: R,
-    err: Option<Error>,
+    stop: bool,
 }
 
-impl<R: Seek + Read> TableIntoIterator<R> {
-    fn error(self) -> Result<()> {
-        if let Some(err) = self.err {
-            Err(err)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl<R: Seek + Read> Iterator for TableIntoIterator<R> {
-    type Item = (Vec<u8>, Vec<u8>);
+// Implement a Iterator to iterating the sstable
+impl<R: Seek + Read> Iterator for SSTableIntoIterator<R> {
+    type Item = Result<(Bytes, Value)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.stop {
+            return None;
+        }
+
         loop {
             match &mut self.block {
                 Some(block) => {
                     // Read the next kv
-                    if let Some((key, value)) = block.next() {
-                        return Some((key, value.to_vec()));
+                    match block.next() {
+                        Some(Ok((key, value))) => {
+                            match Value::decode_from_bytes(value) {
+                                Ok(v) => return Some(Ok((key, v))),
+                                Err(e) => {
+                                    // Unexpected error occurred
+                                    // Stop iteration and return last error
+                                    self.stop = true;
+                                    return Some(Err(e));
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            // Unexpected error occurred
+                            // Stop iteration and return last error
+                            self.stop = true;
+                            return Some(Err(e));
+                        }
+                        None => {
+                            // Reach the end of block iteration
+                            // Restart by index iteration
+                            self.block = None;
+                        }
                     }
-                    // Reach the end of block iteration
-                    self.block = None;
                 }
-                // Read a new block
                 None => {
+                    // Read a new block
                     // Search index if block is none
-                    if let Some(block_info) = self.index.next() {
+                    if let Some(block_item) = self.index.next() {
                         // Read a new block
                         let block_buffer = seek_and_read_buf(
                             &mut self.reader,
-                            SeekFrom::Start(block_info.offset),
-                            block_info.size,
+                            SeekFrom::Start(block_item.offset),
+                            block_item.size,
                         );
-                        if block_buffer.is_err() {
-                            self.err = block_buffer.err().map(Error::from);
-                            return None;
+                        if let Err(e) = block_buffer {
+                            // Unexpected error occurred
+                            // Stop iteration
+                            self.stop = true;
+                            return Some(Err(e.into()));
                         }
                         let block_buffer = block_buffer.unwrap();
 
-                        debug_assert_eq!(block_buffer.len(), block_info.size);
-                        if block_buffer.len() != block_info.size {
-                            self.err = Some(Error::BadSSTable);
-                            return None;
+                        debug_assert_eq!(block_buffer.len(), block_item.size);
+                        if block_buffer.len() != block_item.size {
+                            self.stop = true;
+                            return Some(Err(Error::BadSSTable));
                         }
-                        let block = Block::from_bytes(block_buffer);
-                        if block.is_err() {
-                            self.err = block.err();
-                            return None;
+
+                        let block = Block::from_bytes(block_buffer.into());
+                        if let Err(e) = block {
+                            // Unexpected error occurred
+                            // Stop iteration
+                            self.stop = true;
+                            return Some(Err(e.into()));
                         }
-                        let block = block.unwrap();
-                        self.block = Some(block.into_iter());
+
+                        self.block = Some(block.unwrap().into_iter());
                     } else {
-                        // Read the end of index iteration
                         return None;
                     }
                 }
             }
         }
     }
-}
-
-// Compact two Table and build new table
-pub fn compact<R: Read + Seek, W: Write>(
-    prev: Table<R>,
-    next: Table<R>,
-    builder: &mut TableBuilder<W>,
-) -> Result<()> {
-    let mut prev_iter = prev.into_iter();
-    let mut next_iter = next.into_iter();
-
-    let mut prev_new_kv: Option<(Vec<u8>, Vec<u8>)> = None;
-    let mut next_new_kv: Option<(Vec<u8>, Vec<u8>)> = None;
-
-    // Tables are sorted by key, do merging by using role of merge sort.
-    loop {
-        if prev_new_kv.is_none() {
-            prev_new_kv = prev_iter.next();
-        }
-        if next_new_kv.is_none() {
-            next_new_kv = next_iter.next();
-        }
-
-        // Finish tow iteration, stop merging
-        if next_new_kv.is_none() && prev_new_kv.is_none() {
-            break;
-        } else if next_new_kv.is_some() && prev_new_kv.is_none() {
-            let (key, value) = next_new_kv.unwrap();
-            builder.add(&key, &value)?;
-            next_new_kv = None;
-        } else if next_new_kv.is_none() && prev_new_kv.is_some() {
-            let (key, value) = prev_new_kv.unwrap();
-            builder.add(&key, &value)?;
-            prev_new_kv = None;
-        } else {
-            match next_new_kv.as_ref().unwrap().0[..].cmp(&prev_new_kv.as_ref().unwrap().0[..]) {
-                Ordering::Equal => {
-                    // Always use next table if key is same
-                    let (key, value) = next_new_kv.unwrap();
-                    builder.add(&key, &value)?;
-                    next_new_kv = None;
-                    prev_new_kv = None;
-                }
-                Ordering::Greater => {
-                    let (key, value) = prev_new_kv.unwrap();
-                    builder.add(&key, &value)?;
-                    prev_new_kv = None;
-                }
-                Ordering::Less => {
-                    let (key, value) = next_new_kv.unwrap();
-                    builder.add(&key, &value)?;
-                    next_new_kv = None;
-                }
-            }
-        }
-    }
-
-    // Checkout iteration success
-    prev_iter.error()?;
-    next_iter.error()?;
-
-    // Finish the build
-    builder.finish()?;
-
-    Ok(())
 }
 
 struct Footer {
@@ -322,10 +279,9 @@ impl Footer {
 }
 
 struct BlockItem {
-    key: Vec<u8>,
-    block: Option<Block>, // In memory block
-    offset: u64,          // Data block offset in sstable file
-    size: usize,          // Data block size in sstable file
+    key: Bytes,
+    offset: u64, // Data block offset in sstable file
+    size: usize, // Data block size in sstable file
 }
 
 struct Index {
@@ -337,7 +293,8 @@ impl Index {
         // TODO: Optimize by saving block count into index file
         let mut index = Vec::with_capacity(128);
 
-        for (key, value) in b.iter() {
+        for pair in b.iter() {
+            let (key, value) = pair?;
             debug_assert_eq!(value.len(), 12);
             if value.len() != 12 {
                 return Err(Error::BadSSTableBlock);
@@ -348,7 +305,6 @@ impl Index {
 
             index.push(BlockItem {
                 key,
-                block: None,
                 offset: data_offset,
                 size: data_size,
             });
@@ -359,7 +315,7 @@ impl Index {
 }
 
 // Build a single sstable, use leveldb definition without filter block.
-pub struct TableBuilder<W: Write> {
+pub struct SSTableBuilder<W: Write> {
     writer: W,
     data_block: BlockBuilder,
     index_block: BlockBuilder,
@@ -367,9 +323,9 @@ pub struct TableBuilder<W: Write> {
     offset: u64,
 }
 
-impl<W: Write> TableBuilder<W> {
+impl<W: Write> SSTableBuilder<W> {
     fn new(writer: W) -> Self {
-        TableBuilder {
+        SSTableBuilder {
             writer,
             data_block: BlockBuilder::new(),
             index_block: BlockBuilder::new(),
@@ -379,10 +335,10 @@ impl<W: Write> TableBuilder<W> {
     }
 
     // Add a new key to sstable
-    fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.data_block.add(key, value);
+    fn add(&mut self, key: &[u8], value: Value) -> Result<()> {
+        self.data_block.add(key, &value.to_bytes());
         self.last_key.clear();
-        self.last_key.extend_from_slice(key);
+        self.last_key.extend_from_slice(&key);
 
         // Flush if block size is bigger enough, add a index
         if self.data_block.size_estimate() > BLOCK_DEFAULT_SIZE {
@@ -424,7 +380,7 @@ impl<W: Write> TableBuilder<W> {
         new_index_value[0..8].copy_from_slice(&offset.to_le_bytes()[0..8]);
         new_index_value[8..12].copy_from_slice(&data_size.to_le_bytes()[0..4]);
 
-        self.index_block.add(&self.last_key, &new_index_value)
+        self.index_block.add(&self.last_key, &new_index_value);
     }
 
     fn flush_new_data_block(&mut self) -> Result<(u64, usize)> {
@@ -445,16 +401,20 @@ impl<W: Write> TableBuilder<W> {
 
 #[cfg(test)]
 mod tests {
-    use crate::util::generate_random_bytes_vec;
+    use crate::util::generate_random_bytes;
 
     use super::*;
+    use bytes::Bytes;
     use std::{collections::HashMap, io::Cursor};
 
     #[test]
     fn test_table_build_and_search_with_random_case() {
         let (test_case_key, test_case_value, mut table) = create_new_table_with_random_case(1000);
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            assert_eq!(&table.search_key(key).unwrap().unwrap(), value);
+            assert_eq!(
+                table.search_key(key).unwrap().unwrap(),
+                Value::living(value.clone())
+            );
         }
     }
 
@@ -463,67 +423,73 @@ mod tests {
         let (test_case_key_1, test_case_value_1, mut table_1) =
             create_new_table_with_random_case(1500);
         for (key, value) in test_case_key_1.iter().zip(test_case_value_1.iter()) {
-            assert_eq!(&table_1.search_key(key).unwrap().unwrap(), value);
+            assert_eq!(
+                table_1.search_key(key).unwrap().unwrap(),
+                Value::living(value.clone())
+            );
         }
 
         let (test_case_key_2, test_case_value_2, mut table_2) =
             create_new_table_with_random_case(1000);
         for (key, value) in test_case_key_2.iter().zip(test_case_value_2.iter()) {
-            assert_eq!(&table_2.search_key(key).unwrap().unwrap(), value);
+            assert_eq!(
+                table_2.search_key(key).unwrap().unwrap(),
+                Value::living(value.clone())
+            );
         }
 
         // Build up table
-        let mut builder = TableBuilder::new(Vec::new());
-        compact(table_1, table_2, &mut builder).unwrap();
+        // let mut builder = SSTableBuilder::new(Vec::new());
+        // compact_sstable(table_1, table_2, &mut builder).unwrap();
 
-        // test search operation
-        let writer = builder.writer;
-        let buffer = Cursor::new(writer);
-        let mut table = Table::open(buffer).unwrap();
+        // // test search operation
+        // let writer = builder.writer;
+        // let buffer = Cursor::new(writer);
+        // let mut table = SSTable::open(buffer).unwrap();
 
-        let kv_1: HashMap<_, _> = test_case_key_1
-            .iter()
-            .zip(test_case_value_1.iter())
-            .collect();
+        // let kv_1: HashMap<_, _> = test_case_key_1
+        //     .iter()
+        //     .zip(test_case_value_1.iter())
+        //     .collect();
 
-        let kv_2: HashMap<_, _> = test_case_key_2
-            .iter()
-            .zip(test_case_value_2.iter())
-            .collect();
+        // let kv_2: HashMap<_, _> = test_case_key_2
+        //     .iter()
+        //     .zip(test_case_value_2.iter())
+        //     .collect();
 
-        for key in test_case_key_1.iter().chain(test_case_key_2.iter()) {
-            let value = table.search_key(key).unwrap().unwrap();
-            // Checkout table 2 first
-            if let Some(value2) = kv_2.get(key) {
-                assert_eq!(value, **value2);
-                continue;
-            }
-            if let Some(value2) = kv_1.get(key) {
-                assert_eq!(value, **value2);
-                continue;
-            }
-            panic!("key lost after compaction");
-        }
+        // for key in test_case_key_1.iter().chain(test_case_key_2.iter()) {
+        //     let value = table.search_key(key).unwrap().unwrap();
+        //     // Checkout table 2 first
+        //     if let Some(value2) = kv_2.get(key) {
+        //         assert_eq!(value, **value2);
+        //         continue;
+        //     }
+        //     if let Some(value2) = kv_1.get(key) {
+        //         assert_eq!(value, **value2);
+        //         continue;
+        //     }
+        //     panic!("key lost after compaction");
+        // }
     }
 
     fn create_new_table_with_random_case(
         test_count: usize,
-    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Table<Cursor<Vec<u8>>>) {
+    ) -> (Vec<Bytes>, Vec<Bytes>, SSTable<Cursor<Bytes>>) {
         // Generate random test case
-        let mut test_case_key = generate_random_bytes_vec(test_count, 10000);
-        let test_case_value = generate_random_bytes_vec(test_count, 10 * 32 * 1024);
+        let mut test_case_key = generate_random_bytes(test_count, 10000);
+        let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
         test_case_key.sort();
 
         // Build up table
-        let mut builder = TableBuilder::new(Vec::new());
+        let mut builder = SSTableBuilder::new(Vec::new());
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            builder.add(key, value).unwrap();
+            builder.add(key, Value::living(value.clone())).unwrap();
         }
         builder.finish().unwrap();
 
         // test search operation
-        let buffer = Cursor::new(builder.writer);
-        let table = Table::open(buffer).unwrap();
+        let buffer = Cursor::new(Bytes::from(builder.writer));
+        let table = SSTable::open(buffer).unwrap();
 
         (test_case_key, test_case_value, table)
     }
@@ -533,33 +499,41 @@ mod tests {
         use std::io::Cursor;
 
         let v = Vec::new();
-        let mut builder = TableBuilder::new(v);
-        builder.add(b"123456789", b"1234567689").unwrap();
-        builder.add(b"1234567891", b"1234567689").unwrap();
-        builder.add(b"12345678912", b"1234567689").unwrap();
-        builder.add(b"12345678923", b"1234567689").unwrap();
-        builder.add(b"2", b"2").unwrap();
-        builder.add(b"3", b"3").unwrap();
-        builder.add(b"4", b"").unwrap();
+        let mut builder = SSTableBuilder::new(v);
+        builder
+            .add(b"123456789", Value::living_static(b"1234567689"))
+            .unwrap();
+        builder
+            .add(b"1234567891", Value::living_static(b"1234567689"))
+            .unwrap();
+        builder
+            .add(b"12345678912", Value::living_static(b"1234567689"))
+            .unwrap();
+        builder
+            .add(b"12345678923", Value::living_static(b"1234567689"))
+            .unwrap();
+        builder.add(b"2", Value::living_static(b"2")).unwrap();
+        builder.add(b"3", Value::living_static(b"3")).unwrap();
+        builder.add(b"4", Value::living_static(b"")).unwrap();
         builder.finish().unwrap();
 
         let v = Cursor::new(builder.writer);
-        let mut table = Table::open(v).unwrap();
+        let mut table = SSTable::open(v).unwrap();
 
         let result = table.search_key(b"123456789").unwrap().unwrap();
-        assert_eq!(result, b"1234567689");
+        assert_eq!(result, Value::living_static(b"1234567689"));
         let result = table.search_key(b"1234567891").unwrap().unwrap();
-        assert_eq!(result, b"1234567689");
+        assert_eq!(result, Value::living_static(b"1234567689"));
         let result = table.search_key(b"12345678912").unwrap().unwrap();
-        assert_eq!(result, b"1234567689");
+        assert_eq!(result, Value::living_static(b"1234567689"));
         let result = table.search_key(b"12345678923").unwrap().unwrap();
-        assert_eq!(result, b"1234567689");
+        assert_eq!(result, Value::living_static(b"1234567689"));
         let result = table.search_key(b"2").unwrap().unwrap();
-        assert_eq!(result, b"2");
+        assert_eq!(result, Value::living_static(b"2"));
         let result = table.search_key(b"3").unwrap().unwrap();
-        assert_eq!(result, b"3");
+        assert_eq!(result, Value::living_static(b"3"));
         let result = table.search_key(b"4").unwrap().unwrap();
-        assert_eq!(result, b"");
+        assert_eq!(result, Value::living_static(b""));
         assert!(table.search_key(b"1000").unwrap().is_none());
         assert!(table.search_key(b"1").unwrap().is_none());
         assert!(table.search_key(b"666").unwrap().is_none());

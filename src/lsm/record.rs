@@ -12,7 +12,7 @@ use crate::util::{checksum, from_le_bytes_32, read_exact};
 use super::{Error, Result};
 use std::io::{Cursor, Read, Write};
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 
 const RECORD_BLOCK_SIZE: usize = 32 * 1024; // 32kb for every block
 const RECORD_HEADER_SIZE: usize = 1 + 2 + 4; // record_type + record_len + record_checksum
@@ -42,6 +42,7 @@ impl From<u8> for RecordType {
     }
 }
 
+// Read and parse item from given bytes stream, implemented as a Iterator
 pub struct RecordReader<R: Read> {
     reader: R,
     buffer: Vec<u8>,
@@ -63,6 +64,7 @@ impl<R: Read> RecordReader<R> {
         r
     }
 
+    // Parse a new record, act as a cursor
     fn parse_record(&mut self) -> Result<Option<(RecordType, &[u8])>> {
         debug_assert!(self.offset <= self.buffer.len());
         if self.buffer.len() - self.offset < RECORD_HEADER_SIZE {
@@ -79,7 +81,7 @@ impl<R: Read> RecordReader<R> {
         // Parse record type, illegal record type means illegal log format
         let record_type: RecordType = self.buffer[self.offset + 6].into();
         if record_type == RecordType::Illegal {
-            return Err(Error::IllegalLogRecord);
+            return Err(Error::IllegalRecord);
         }
 
         // Parse length of data, exceeded length means illegal log format
@@ -94,14 +96,14 @@ impl<R: Read> RecordReader<R> {
             if self.buffer.len() < RECORD_BLOCK_SIZE {
                 return Ok(None);
             }
-            return Err(Error::IllegalLogRecord);
+            return Err(Error::IllegalRecord);
         }
         let data = &self.buffer[self.offset + RECORD_HEADER_SIZE..data_right_boundary];
 
         // Check checksum
         let checksum_result = from_le_bytes_32(&self.buffer[self.offset..self.offset + 4]) as u32;
         if checksum(data) != checksum_result {
-            return Err(Error::IllegalLogRecord);
+            return Err(Error::IllegalRecord);
         }
 
         self.offset += length + RECORD_HEADER_SIZE;
@@ -110,7 +112,7 @@ impl<R: Read> RecordReader<R> {
 }
 
 impl<R: Read> Iterator for RecordReader<R> {
-    type Item = Result<Vec<u8>>;
+    type Item = Result<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut content = Vec::new();
@@ -124,14 +126,14 @@ impl<R: Read> Iterator for RecordReader<R> {
                         RecordType::Full => {
                             // Full record prev record type is not exist
                             if prev_record_type.is_some() {
-                                return Some(Err(Error::IllegalLogRecord));
+                                return Some(Err(Error::IllegalRecord));
                             }
-                            return Some(Ok(Vec::from(data)));
+                            return Some(Ok(Bytes::copy_from_slice(data)));
                         }
                         RecordType::First => {
                             // First record prev record type is not exist
                             if prev_record_type.is_some() {
-                                return Some(Err(Error::IllegalLogRecord));
+                                return Some(Err(Error::IllegalRecord));
                             }
                             content.reserve(2 * data.len());
                             content.extend_from_slice(data);
@@ -143,7 +145,7 @@ impl<R: Read> Iterator for RecordReader<R> {
                                 prev_record_type,
                                 Some(RecordType::First) | Some(RecordType::Middle)
                             ) {
-                                return Some(Err(Error::IllegalLogRecord));
+                                return Some(Err(Error::IllegalRecord));
                             }
                             content.extend_from_slice(data);
                             prev_record_type = Some(RecordType::Middle);
@@ -154,10 +156,10 @@ impl<R: Read> Iterator for RecordReader<R> {
                                 prev_record_type,
                                 Some(RecordType::First) | Some(RecordType::Middle)
                             ) {
-                                return Some(Err(Error::IllegalLogRecord));
+                                return Some(Err(Error::IllegalRecord));
                             }
                             content.extend_from_slice(data);
-                            return Some(Ok(content));
+                            return Some(Ok(Bytes::from(content)));
                         }
                         _ => unreachable!("never be illegal type"),
                     }
@@ -189,12 +191,13 @@ impl<W: Write> RecordWriter<W> {
     }
 
     // Get total writen bytes count
+    #[inline]
     pub fn written(&self) -> usize {
         self.total_written
     }
 
-    // Append data into record file
-    pub fn append(&mut self, data: Vec<u8>) -> Result<()> {
+    // Append data into record file and return the total written count
+    pub fn append(&mut self, data: Bytes) -> Result<usize> {
         let mut cursor = Cursor::new(data);
 
         let mut is_first = true;
@@ -246,8 +249,7 @@ impl<W: Write> RecordWriter<W> {
 
         // Flush data to persistent record
         self.writer.flush()?;
-
-        Ok(())
+        Ok(self.written())
     }
 
     // Encode a new record into record file
@@ -287,13 +289,12 @@ impl<W: Write> RecordWriter<W> {
 
 #[cfg(test)]
 mod tests {
-    use rand::{Rng, RngCore};
-
     use super::*;
+    use crate::util::generate_random_bytes;
 
     #[test]
     fn test_read_writer_with_random_case() {
-        let test_case = generate_random_bytes_vec(1000);
+        let test_case = generate_random_bytes(1000, 10 * RECORD_BLOCK_SIZE);
 
         // write to buffer
         let v = Vec::new();
@@ -322,18 +323,5 @@ mod tests {
             assert_eq!(&elem.unwrap()[..], test_case[idx]);
         }
         assert_eq!(total, test_case.len() - 1);
-    }
-
-    fn generate_random_bytes_vec(num: usize) -> Vec<Vec<u8>> {
-        let mut v = Vec::with_capacity(num);
-
-        for _ in 0..num {
-            let mut rng = rand::thread_rng();
-            let size: usize = rng.gen_range(0..10 * RECORD_BLOCK_SIZE);
-            let mut new_bytes = vec![0; size];
-            rng.fill_bytes(&mut new_bytes[..]);
-            v.push(new_bytes);
-        }
-        v
     }
 }
