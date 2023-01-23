@@ -4,13 +4,12 @@ use crate::util::{checksum, from_le_bytes_32, from_le_bytes_64, seek_and_read_bu
 
 use super::{
     block::{Block, BlockBuilder, BlockIntoIterator},
-    error,
     util::Value,
     Error, Result,
 };
 use std::{
-    cmp::Ordering,
     io::{Read, Seek, SeekFrom, Write},
+    sync::{Arc, Mutex},
 };
 
 const FOOTER_SIZE: usize = 12; // 12bytes
@@ -18,7 +17,7 @@ const BLOCK_DEFAULT_SIZE: usize = 4 * 1024; // 4kb
 
 pub struct SSTable<R: Seek + Read> {
     index: Index,
-    reader: R,
+    reader: Arc<Mutex<Option<R>>>,
     range: (Bytes, Bytes), // Key range of this table [xxx, xxx]
 }
 
@@ -98,12 +97,13 @@ impl<R: Seek + Read> SSTable<R> {
 
         Ok(SSTable {
             index,
-            reader,
+            reader: Arc::new(Mutex::new(Some(reader))),
             range: (first_key, last_key),
         })
     }
 
-    pub fn search_key(&mut self, key: &[u8]) -> Result<Option<Value>> {
+    pub fn search_key(&self, key: &[u8]) -> Result<Option<Value>> {
+        debug_assert!(self.reader.lock().unwrap().is_some());
         if !self.in_range(key) {
             return Ok(None);
         }
@@ -113,12 +113,11 @@ impl<R: Seek + Read> SSTable<R> {
             .index
             .binary_search_by_key(&key, |elem| &elem.key[..])
             .unwrap_or_else(|x| x);
-
         debug_assert!(search_index < self.index.index.len());
 
         let block_info = &self.index.index[search_index];
         let block_buffer = seek_and_read_buf(
-            &mut self.reader,
+            (&mut *self.reader.lock().unwrap()).as_mut().unwrap(),
             SeekFrom::Start(block_info.offset),
             block_info.size,
         )?;
@@ -143,10 +142,12 @@ impl<R: Read + Seek> IntoIterator for SSTable<R> {
     type IntoIter = SSTableIntoIterator<R>;
 
     fn into_iter(self) -> Self::IntoIter {
+        // Reader is always exists
+        debug_assert!(self.reader.lock().unwrap().is_some());
         SSTableIntoIterator {
             block: None,
             index: self.index.index.into_iter(),
-            reader: self.reader,
+            reader: (*self.reader.lock().unwrap()).take().unwrap(),
             stop: false,
         }
     }

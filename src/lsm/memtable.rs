@@ -7,9 +7,10 @@ use super::{
     util::Value,
     Error, Result,
 };
+use parking_lot::{Mutex, RwLock};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicU64, Ordering},
@@ -37,7 +38,7 @@ impl MemTable {
     pub fn open(root_path: impl Into<PathBuf>) -> Result<Self> {
         // Try to create log root directory at this path.
         let root_path: PathBuf = root_path.into();
-        fs::create_dir_all(root_path.clone())?;
+        fs::create_dir_all(root_path.as_path())?;
 
         // Scan the root_path directory, find all log sorted by sequence number
         let log_files = scan_sorted_file_at_path(&root_path)?;
@@ -52,7 +53,7 @@ impl MemTable {
 
             // Recover immutable memtable
             for (path, _) in log_files.iter() {
-                let reader = RecordReader::new(File::open(path.clone())?);
+                let reader = RecordReader::new(File::open(path.as_path())?);
                 let mut table = KVTable::new(path.clone());
                 for data in reader {
                     let (key, value) = decode_kv(data?)?;
@@ -63,7 +64,8 @@ impl MemTable {
                 let immutable_table = Arc::new(table);
                 tables.push(Arc::clone(&immutable_table));
                 // Ask to dump the immutable memtable
-                tx.send(DumpRequest::new(immutable_table, finish_tx.clone()));
+                let send_result = tx.send(DumpRequest::new(immutable_table, finish_tx.clone()));
+                debug_assert!(send_result.is_ok());
             }
             (tables, log_files.last().unwrap().1 + 1)
         } else {
@@ -100,12 +102,12 @@ impl MemTable {
     // Get the value by key
     pub fn get(&self, key: &Bytes) -> Option<Value> {
         // Read mutable first
-        if let Some(value) = self.mutable.lock().unwrap().entries.get(key) {
+        if let Some(value) = self.mutable.lock().entries.get(key) {
             return Some(value.clone());
         }
 
         // Read from immutable list
-        let immutable = self.immutable.read().unwrap();
+        let immutable = self.immutable.read();
         for table in &*immutable {
             if let Some(value) = table.entries.get(key) {
                 return Some(value.clone());
@@ -116,7 +118,7 @@ impl MemTable {
 
     // Set the key-value pair into mutable
     pub fn set(&self, key: Bytes, value: Value) -> Result<()> {
-        let mut mutable = self.mutable.lock().unwrap();
+        let mut mutable = self.mutable.lock();
         // Mutable log must exists
         debug_assert!(mutable.log.is_some());
 
@@ -148,11 +150,14 @@ impl MemTable {
             let immutable = Arc::new(new_mutable);
             // Release immutable first, read requests see new empty mutable after new immutable first.
             // Previous write would not be lost on this read requests.
-            self.immutable.write().unwrap().push(Arc::clone(&immutable));
+            self.immutable.write().push(Arc::clone(&immutable));
 
             // Send a dump request
-            self.dump_tx
+            // Send operation would never fail
+            let result = self
+                .dump_tx
                 .send(DumpRequest::new(immutable, self.dump_finish_tx.clone()));
+            debug_assert!(result.is_ok());
         }
 
         Ok(())
@@ -163,10 +168,11 @@ impl MemTable {
         tokio::spawn(async move {
             // Clear log file and remove memtable if dump is finished
             while let Some(path) = receiver.recv().await {
-                let mut tables = immutable.write().unwrap();
+                let mut tables = immutable.write();
                 if let Some(first_table) = tables.first() {
                     if path == first_table.path {
-                        fs::remove_file(path);
+                        // TODO: remove should be log
+                        fs::remove_file(path).unwrap();
                         tables.remove(0);
                     }
                 }

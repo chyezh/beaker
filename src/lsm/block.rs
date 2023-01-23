@@ -131,17 +131,6 @@ impl Block {
         })
     }
 
-    // Transform into iterator
-    pub fn into_iter(self) -> BlockIntoIterator {
-        BlockIntoIterator {
-            data: self.data,
-            compress_restart_offset: self.compress_restart_offset,
-            last_key: Vec::with_capacity(128),
-            counter: 0,
-            restart_offset_idx: 0,
-        }
-    }
-
     // Create a new iterator
     pub fn iter(&self) -> BlockIterator {
         BlockIterator {
@@ -197,6 +186,22 @@ impl Block {
             value,
             data.slice(next_data_offset..),
         ))
+    }
+}
+
+impl IntoIterator for Block {
+    type Item = Result<(Bytes, Bytes)>;
+    type IntoIter = BlockIntoIterator;
+
+    // Transform into iterator
+    fn into_iter(self) -> BlockIntoIterator {
+        BlockIntoIterator {
+            data: self.data,
+            compress_restart_offset: self.compress_restart_offset,
+            last_key: Vec::with_capacity(128),
+            counter: 0,
+            restart_offset_idx: 0,
+        }
     }
 }
 

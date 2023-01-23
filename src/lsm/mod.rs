@@ -1,13 +1,11 @@
 mod error;
 pub use error::Error;
 
-mod memtable;
-
-mod record;
-
 mod block;
+mod manifest;
+mod memtable;
+mod record;
 mod sstable;
-
 mod util;
 
 // Module result type
