@@ -17,6 +17,7 @@ const SSTABLE_FILE_EXTENSION: &str = "tbl";
 const MANIFEST_FILE_EXTENSION: &str = "manifest";
 const MINIMUM_SSTABLE_ENTRY_SIZE: usize = 28;
 const MINIMUM_MANIFEST_INNER_SIZE: usize = 8;
+const SPLIT_MANIFEST_SIZE_THRESHOLD: usize = 32 * 1024 * 1024; // 32MB
 
 struct SSTableEntry {
     lv: usize,
@@ -106,6 +107,7 @@ impl SSTableEntry {
             .slice(right_boundary_len_start + 4..right_boundary_len_start + 4 + right_boundary_len);
 
         // Check if sstable file exist
+        let file_path = Self::file_path(root_path.clone(), &uid);
         if !Self::file_path(root_path.clone(), &uid).is_file() {
             return Err(Error::IllegalSSTableEntry);
         }
@@ -134,6 +136,7 @@ impl SSTableEntry {
     }
 }
 
+#[derive(Clone)]
 struct ManifestInner {
     version: u64,
     tables: Vec<Vec<Arc<SSTableEntry>>>,
@@ -199,7 +202,7 @@ impl ManifestInner {
             // Check if level is valid
             // Level must be monotonic
             debug_assert!(entry.lv >= lv);
-            if tables.len() < entry.lv {
+            if tables.len() <= entry.lv {
                 tables.resize(entry.lv + 1, Vec::new());
             }
 
@@ -220,6 +223,7 @@ struct ManifestPersister {
 }
 
 impl ManifestPersister {
+    // Open persist file
     fn open(root_path: PathBuf, seq: u64) -> Result<Self> {
         let new_file = open_new_manifest(&root_path, seq)?;
         let log = RecordWriter::new(new_file);
@@ -230,6 +234,24 @@ impl ManifestPersister {
             root_path,
             next_log_seq,
         })
+    }
+
+    // Persist given manifest info into file
+    fn persist(&mut self, manifest: &ManifestInner) -> Result<()> {
+        // Switch new file if needed
+        let total_write = self.log.written();
+        if total_write > SPLIT_MANIFEST_SIZE_THRESHOLD {
+            self.log = RecordWriter::new(open_new_manifest(&self.root_path, self.next_log_seq)?);
+            self.next_log_seq += 1;
+        }
+
+        // Write manifest information
+        let mut buffer = Vec::with_capacity(manifest.encode_bytes_len());
+        manifest.encode_to(&mut buffer);
+        self.log.append(buffer.into())?;
+
+        // TODO: clear old manifest file
+        Ok(())
     }
 }
 
@@ -269,7 +291,8 @@ impl Manifest {
             match last_valid_manifest_binary {
                 Some(data) => {
                     // Parsing manifest inner information
-                    let inner = ManifestInner::decode_from_bytes(root_path.clone(), data)?;
+                    let inner =
+                        ManifestInner::decode_from_bytes(sstable_root_path(&root_path), data)?;
                     (inner, manifest_files.last().unwrap().1 + 1)
                 }
                 None => {
@@ -316,14 +339,25 @@ impl Manifest {
     }
 
     // Add a new sstable file into manifest
-    pub fn add_new_sstable(&self, entry: SSTableEntry) {
+    pub fn add_new_sstable(&self, entry: SSTableEntry) -> Result<()> {
         debug_assert!(!entry.range.0.is_empty());
         debug_assert!(entry.range.0 <= entry.range.1);
-        debug_assert!(!self.inner.read().tables.is_empty());
         debug_assert_eq!(entry.lv, 0);
 
-        // always add new entry into lv 0
-        self.inner.write().tables[0].push(Arc::new(entry));
+        let manifest = self.inner.upgradable_read();
+        let mut new_manifest = manifest.clone();
+        debug_assert!(!new_manifest.tables.is_empty());
+        new_manifest.version += 1;
+        new_manifest.tables[0].push(Arc::new(entry));
+
+        // Persist manifest
+        self.persister.lock().persist(&new_manifest)?;
+
+        // Modify in-memory manifest
+        let mut manifest = RwLockUpgradableReadGuard::upgrade(manifest);
+        *manifest = new_manifest;
+
+        Ok(())
     }
 
     // Generate a new compact task
@@ -407,12 +441,18 @@ impl<'a> CompactTask<'a> {
             tables.push(high_lv_tables);
         }
 
-        // Write new version
-        let mut manifest = RwLockUpgradableReadGuard::upgrade(manifest);
-        manifest.version += 1;
-        manifest.tables = tables;
+        let new_manifest = ManifestInner {
+            version: manifest.version + 1,
+            tables,
+        };
 
-        // TODO: Persistent
+        // Persist new version manifest
+        self.manifest.persister.lock().persist(&new_manifest)?;
+
+        // Write new version in memory
+        let mut manifest = RwLockUpgradableReadGuard::upgrade(manifest);
+        *manifest = new_manifest;
+
         Ok(())
     }
 
@@ -472,4 +512,27 @@ fn open_new_manifest(dir: &Path, seq: u64) -> Result<File> {
         .open(&path)?;
 
     Ok(new_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest() {
+        {
+            let manifest = Manifest::open("./data").unwrap();
+            let mut new_entry = manifest.alloc_new_sstable_entry().unwrap();
+            let mut entry_writer = new_entry.open_writer().unwrap();
+            entry_writer.write_all(b"123123123123").unwrap();
+            new_entry.set_range((Bytes::from("123"), Bytes::from("456")));
+
+            manifest.add_new_sstable(new_entry).unwrap();
+        }
+
+        {
+            let manifest = Manifest::open("./data").unwrap();
+            assert_eq!(manifest.inner.read().tables[0].len(), 1);
+        }
+    }
 }
