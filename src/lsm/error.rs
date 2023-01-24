@@ -26,4 +26,10 @@ pub enum Error {
 
     #[error("bad sstable footer")]
     BadSSTableBlockFooter,
+
+    #[error("illegal sstable entry")]
+    IllegalSSTableEntry,
+
+    #[error("illegal manifest")]
+    IllegalManifest,
 }

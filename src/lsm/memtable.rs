@@ -4,7 +4,7 @@ use crate::util::from_le_bytes_32;
 
 use super::{
     record::{RecordReader, RecordWriter},
-    util::Value,
+    util::{scan_sorted_file_at_path, Value},
     Error, Result,
 };
 use parking_lot::{Mutex, RwLock};
@@ -41,7 +41,7 @@ impl MemTable {
         fs::create_dir_all(root_path.as_path())?;
 
         // Scan the root_path directory, find all log sorted by sequence number
-        let log_files = scan_sorted_file_at_path(&root_path)?;
+        let log_files = scan_sorted_file_at_path(&root_path, LOG_FILE_EXTENSION)?;
 
         // Create dump task channel
         let (tx, rx) = mpsc::unbounded_channel::<DumpRequest>();
@@ -257,31 +257,6 @@ fn open_new_log(dir: &Path, log_seq: u64) -> Result<(File, PathBuf)> {
         .open(&new_log_path)?;
 
     Ok((new_file, new_log_path))
-}
-
-// Scan given log root directory and get all sorted log file
-fn scan_sorted_file_at_path(path: &Path) -> Result<Vec<(PathBuf, u64)>> {
-    // example of log file name format: 1.log 2.log
-    let mut filenames: Vec<_> = fs::read_dir(path)?
-        .flat_map(|elem| -> Result<PathBuf> { Ok(elem?.path()) }) // filter read_dir failed paths
-        .filter_map(|elem| {
-            if !elem.is_file() || elem.extension() != Some(LOG_FILE_EXTENSION.as_ref()) {
-                None
-            } else if let Some(Ok(log_num)) = elem
-                .file_stem()
-                .and_then(std::ffi::OsStr::to_str)
-                .map(str::parse::<u64>)
-            {
-                Some((elem, log_num))
-            } else {
-                None
-            }
-        }) // filter illegal filename and get log seq no
-        .collect();
-
-    // sort filenames with log seq no
-    filenames.sort_by_key(|elem| elem.1);
-    Ok(filenames)
 }
 
 // Implement kv table

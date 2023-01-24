@@ -2,6 +2,8 @@ use bytes::Bytes;
 use std::io::Write;
 
 use super::{Error, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 const LIVING_VALUE_TYPE: u8 = 1;
 const TOMBSTONE_VALUE_TYPE: u8 = 0;
@@ -77,4 +79,29 @@ impl Value {
         };
         Ok(())
     }
+}
+
+// Scan given directory and get all sorted file with given extension
+pub fn scan_sorted_file_at_path(path: &Path, extension: &str) -> Result<Vec<(PathBuf, u64)>> {
+    // example of log file name format: 1.log 2.log
+    let mut filenames: Vec<_> = fs::read_dir(path)?
+        .flat_map(|elem| -> Result<PathBuf> { Ok(elem?.path()) }) // filter read_dir failed paths
+        .filter_map(|elem| {
+            if !elem.is_file() || elem.extension() != Some(extension.as_ref()) {
+                None
+            } else if let Some(Ok(log_num)) = elem
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .map(str::parse::<u64>)
+            {
+                Some((elem, log_num))
+            } else {
+                None
+            }
+        }) // filter illegal filename and get log seq no
+        .collect();
+
+    // sort filenames with log seq no
+    filenames.sort_by_key(|elem| elem.1);
+    Ok(filenames)
 }
