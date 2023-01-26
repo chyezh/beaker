@@ -7,10 +7,11 @@ use crate::util::{from_le_bytes_32, from_le_bytes_64};
 use super::record::RecordWriter;
 use super::util::scan_sorted_file_at_path;
 use super::{Error, Result};
-use parking_lot::{Mutex, MutexGuard, RwLock, RwLockUpgradableReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 const SSTABLE_FILE_EXTENSION: &str = "tbl";
@@ -19,12 +20,37 @@ const MINIMUM_SSTABLE_ENTRY_SIZE: usize = 28;
 const MINIMUM_MANIFEST_INNER_SIZE: usize = 8;
 const SPLIT_MANIFEST_SIZE_THRESHOLD: usize = 32 * 1024 * 1024; // 32MB
 
-struct SSTableEntry {
+#[derive(Debug, Default, Clone)]
+struct SSTableRange {
+    left: Bytes,
+    right: Bytes,
+}
+
+impl SSTableRange {
+    // Merge two overlap range
+    fn merge_if_overlap(&mut self, other: &SSTableRange) {
+        if self.is_overlap(other) {
+            if self.left > other.left {
+                self.left = other.left.clone()
+            }
+            if self.right < other.right {
+                self.right = other.right.clone()
+            }
+        }
+    }
+
+    // Check if two range is overlapping
+    fn is_overlap(&self, other: &SSTableRange) -> bool {
+        !(self.right < other.left || self.left > other.right)
+    }
+}
+
+pub struct SSTableEntry {
     lv: usize,
     uid: Uuid,
     root_path: PathBuf,
-    compact_lock: Mutex<()>,
-    range: (Bytes, Bytes),
+    range: SSTableRange,
+    compact_lock: AtomicU8,
 }
 
 impl SSTableEntry {
@@ -47,15 +73,15 @@ impl SSTableEntry {
         Ok(new_file)
     }
 
-    pub fn set_range(&mut self, range: (Bytes, Bytes)) {
-        debug_assert!(range.0 <= range.1);
+    pub fn set_range(&mut self, range: SSTableRange) {
+        debug_assert!(range.left <= range.right);
         self.range = range;
     }
 
     // Get encode bytes length for pre-allocation
     #[inline]
     fn encode_bytes_len(&self) -> usize {
-        MINIMUM_SSTABLE_ENTRY_SIZE + self.range.0.len() + self.range.1.len()
+        MINIMUM_SSTABLE_ENTRY_SIZE + self.range.left.len() + self.range.right.len()
     }
 
     // Encode into bytes and write to given Write
@@ -68,10 +94,10 @@ impl SSTableEntry {
     fn encode_to<W: Write>(&self, mut w: W) -> Result<()> {
         w.write_all(&self.lv.to_le_bytes()[0..4])?;
         w.write_all(&self.uid.to_bytes_le())?;
-        w.write_all(&self.range.0.len().to_le_bytes()[0..4])?;
-        w.write_all(&self.range.0)?;
-        w.write_all(&self.range.1.len().to_le_bytes()[0..4])?;
-        w.write_all(&self.range.1)?;
+        w.write_all(&self.range.left.len().to_le_bytes()[0..4])?;
+        w.write_all(&self.range.left)?;
+        w.write_all(&self.range.right.len().to_le_bytes()[0..4])?;
+        w.write_all(&self.range.right)?;
         Ok(())
     }
 
@@ -107,7 +133,6 @@ impl SSTableEntry {
             .slice(right_boundary_len_start + 4..right_boundary_len_start + 4 + right_boundary_len);
 
         // Check if sstable file exist
-        let file_path = Self::file_path(root_path.clone(), &uid);
         if !Self::file_path(root_path.clone(), &uid).is_file() {
             return Err(Error::IllegalSSTableEntry);
         }
@@ -116,14 +141,24 @@ impl SSTableEntry {
             lv,
             uid,
             root_path,
-            compact_lock: Mutex::new(()),
-            range: (left_boundary, right_boundary),
+            compact_lock: AtomicU8::new(0),
+            range: SSTableRange::default(),
         })
     }
 
-    // Try to lock compact process
-    fn try_compact_lock(&self) -> Option<MutexGuard<()>> {
-        self.compact_lock.try_lock()
+    // Try to lock for compact process
+    fn try_compact_lock(&self) -> Result<()> {
+        // Just keep atomic, no memory barrier needed
+        self.compact_lock
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::SSTableEntryLockFailed)?;
+        Ok(())
+    }
+
+    // release compact lock
+    fn release_lock(&self) {
+        // release the lock
+        self.compact_lock.store(0, Ordering::Release);
     }
 
     fn file_path(root_path: PathBuf, uid: &Uuid) -> PathBuf {
@@ -132,7 +167,7 @@ impl SSTableEntry {
     }
 
     fn sort_key(&self) -> Bytes {
-        self.range.0.clone()
+        self.range.left.clone()
     }
 }
 
@@ -327,21 +362,21 @@ impl Manifest {
     }
 
     // Alloc a new sstable entry, and return its writer
-    pub fn alloc_new_sstable_entry(&self) -> Result<SSTableEntry> {
+    pub fn alloc_new_sstable_entry(&self) -> SSTableEntry {
         let uid = Uuid::new_v4();
-        Ok(SSTableEntry {
+        SSTableEntry {
             uid,
             root_path: sstable_root_path(&self.root_path),
             lv: 0,
-            range: (Bytes::new(), Bytes::new()),
-            compact_lock: Mutex::new(()),
-        })
+            range: SSTableRange::default(),
+            compact_lock: AtomicU8::new(0),
+        }
     }
 
-    // Add a new sstable file into manifest
+    // Add a new sstable file into manifest, persist modification and update in-memory manifest
     pub fn add_new_sstable(&self, entry: SSTableEntry) -> Result<()> {
-        debug_assert!(!entry.range.0.is_empty());
-        debug_assert!(entry.range.0 <= entry.range.1);
+        debug_assert!(!entry.range.left.is_empty());
+        debug_assert!(entry.range.left <= entry.range.right);
         debug_assert_eq!(entry.lv, 0);
 
         let manifest = self.inner.upgradable_read();
@@ -360,82 +395,47 @@ impl Manifest {
         Ok(())
     }
 
-    // Generate a new compact task
-    fn new_compact_task<'a>(&'a self) -> Option<CompactTask<'a>> {
-        Some(CompactTask {
-            low_lv: CompactTaskInput {
-                tables: Vec::new(),
-                lv: 0,
-            },
-            high_lv: CompactTaskInput {
-                tables: Vec::new(),
-                lv: 0,
-            },
-            new: Vec::new(),
-            compact_size_threshold: 0,
-            compact_locks: Vec::new(),
-            manifest: self.clone(),
-        })
-    }
-}
-
-struct CompactTaskInput {
-    tables: Vec<Arc<SSTableEntry>>,
-    lv: usize,
-}
-
-struct CompactTask<'a> {
-    pub low_lv: CompactTaskInput,           // compact low level inputs
-    pub high_lv: CompactTaskInput,          // compact high level inputs
-    pub new: Vec<SSTableEntry>,             // compact output
-    pub compact_size_threshold: usize,      // compact output size threshold
-    compact_locks: Vec<MutexGuard<'a, ()>>, // compact locks
-    manifest: Manifest,
-}
-
-impl<'a> CompactTask<'a> {
-    // Write down the compact result into manifest
-    // Clear low_lv high_lv inputs, add new tables into high level layer
-    pub fn finish(self) -> Result<()> {
-        let manifest = self.manifest.inner.upgradable_read();
-        debug_assert!(manifest.tables.len() > self.low_lv.lv); // Low level layer must exist
-        debug_assert!(manifest.tables.len() >= self.high_lv.lv); // High level layer may be created at compaction
+    // Finish compact, try to persist compact result and update in-memory manifest
+    pub fn finish_compact(&self, task: CompactTask) -> Result<()> {
+        let manifest = self.inner.upgradable_read();
+        debug_assert!(manifest.tables.len() > task.low_lv.lv); // Low level layer must exist
+        debug_assert!(manifest.tables.len() >= task.high_lv.lv); // High level layer may be created at compaction
 
         // Clear outdate entry and add new entry in low or high level layer
-        let low_lv_tables = Self::merge_tables(
-            &manifest.tables[self.low_lv.lv],
-            &self.low_lv.tables,
+        let low_lv_tables = merge_tables(
+            &manifest.tables[task.low_lv.lv],
+            &task.low_lv.tables,
             Vec::new(),
         );
-        let high_lv_tables = if manifest.tables.len() > self.high_lv.lv {
-            Self::merge_tables(
-                &manifest.tables[self.high_lv.lv],
-                &self.high_lv.tables,
-                self.new,
+        let high_lv_tables = if manifest.tables.len() > task.high_lv.lv {
+            merge_tables(
+                &manifest.tables[task.high_lv.lv],
+                &task.high_lv.tables,
+                task.new,
             )
         } else {
             let origin = Vec::new();
-            Self::merge_tables(&origin, &self.high_lv.tables, self.new)
+            merge_tables(&origin, &task.high_lv.tables, task.new)
         };
 
         // Construct new tables
         let mut tables = Vec::with_capacity(manifest.tables.len() + 1);
-        for lv in 0..self.low_lv.lv {
+        for lv in 0..task.low_lv.lv {
             tables.push(manifest.tables[lv].clone());
         }
         tables.push(low_lv_tables);
-        if manifest.tables.len() > self.high_lv.lv {
+        if manifest.tables.len() > task.high_lv.lv {
             // No new layer
-            for lv in self.low_lv.lv + 1..self.high_lv.lv {
+            for lv in task.low_lv.lv + 1..task.high_lv.lv {
                 tables.push(manifest.tables[lv].clone());
             }
             tables.push(high_lv_tables);
-            for lv in self.high_lv.lv + 1..manifest.tables.len() {
+            for lv in task.high_lv.lv + 1..manifest.tables.len() {
                 tables.push(manifest.tables[lv].clone());
             }
         } else {
             // Add new layer
-            for lv in self.low_lv.lv + 1..manifest.tables.len() {
+            for lv in task.low_lv.lv + 1..manifest.tables.len() {
                 tables.push(manifest.tables[lv].clone());
             }
             tables.push(high_lv_tables);
@@ -447,7 +447,7 @@ impl<'a> CompactTask<'a> {
         };
 
         // Persist new version manifest
-        self.manifest.persister.lock().persist(&new_manifest)?;
+        self.persister.lock().persist(&new_manifest)?;
 
         // Write new version in memory
         let mut manifest = RwLockUpgradableReadGuard::upgrade(manifest);
@@ -456,40 +456,159 @@ impl<'a> CompactTask<'a> {
         Ok(())
     }
 
-    // Clear "clear" in "origin" and add "new" into "origin"
-    fn merge_tables(
-        origin: &Vec<Arc<SSTableEntry>>,
-        clear: &Vec<Arc<SSTableEntry>>,
-        new: Vec<SSTableEntry>,
-    ) -> Vec<Arc<SSTableEntry>> {
-        let new_len = new.len();
-        let mut new_tables = Vec::with_capacity(origin.len() + clear.len() - new_len);
+    fn find_new_compact_tasks(&self) -> Vec<CompactTask> {
+        let manifest = self.inner.read();
+        let mut tasks = Vec::new();
 
-        // Clear old data
-        for entry in origin.iter() {
-            let mut hold_on = true;
-            for old_entry in clear.iter() {
-                if entry.uid == old_entry.uid {
-                    hold_on = false;
-                    break;
+        for (lv, tables) in manifest.tables.iter().enumerate() {
+            // Try to compact if level-0's tables count is gte 4
+            // Try to compact if other level tables count is gte 10
+            if (lv == 0 && tables.len() >= 4) || tables.len() >= 10 {
+                for (idx, _) in tables.iter().enumerate() {
+                    if let Ok(task) = CompactTask::new(&manifest, lv, idx) {
+                        tasks.push(task);
+                        // Generate one task for every level
+                        break;
+                    }
                 }
             }
-            if hold_on {
-                new_tables.push(Arc::clone(entry));
+        }
+
+        tasks
+    }
+}
+
+pub struct CompactSSTables {
+    tables: Vec<Arc<SSTableEntry>>,
+    lv: usize,
+}
+
+impl Drop for CompactSSTables {
+    fn drop(&mut self) {
+        // Should release all compaction lock
+        // CompactTask can be finished or failed
+        for table in self.tables.iter() {
+            table.release_lock();
+        }
+    }
+}
+
+pub struct CompactTask {
+    low_lv: CompactSSTables,
+    high_lv: CompactSSTables,
+    new: Vec<SSTableEntry>,
+}
+
+impl CompactTask {
+    // Create new compact task with given manifest and compact target sstable
+    // Find all overlapping sstables and create task
+    fn new(manifest: &ManifestInner, lv: usize, idx: usize) -> Result<Self> {
+        debug_assert!(manifest.tables.len() > lv);
+        debug_assert!(manifest.tables[lv].len() > idx);
+
+        let table = &manifest.tables[lv][idx];
+        let mut range = table.range.clone();
+
+        // Try to get compaction lock
+        table.try_compact_lock()?;
+        let mut low_lv = CompactSSTables {
+            tables: vec![table.clone()],
+            lv,
+        };
+        let mut high_lv = CompactSSTables {
+            tables: Vec::new(),
+            lv: lv + 1,
+        };
+
+        if lv == 0 {
+            // Search overlap sstable in level-0
+            for (i, other) in manifest.tables[0].iter().enumerate() {
+                if idx != i && range.is_overlap(&other.range) {
+                    // Overlap found, try lock and merge range
+                    other.try_compact_lock()?;
+                    low_lv.tables.push(other.clone());
+                    range.merge_if_overlap(&other.range);
+                }
             }
         }
 
-        // Add new data
-        for entry in new {
-            new_tables.push(Arc::new(entry));
+        // Search overlap sstable in high level
+        if let Some(tables) = manifest.tables.get(lv + 1) {
+            for other in tables.iter() {
+                // Overlap found, try lock
+                // High level range never overlap with each other, no range merge needed
+                other.try_compact_lock()?;
+                high_lv.tables.push(other.clone());
+            }
         }
 
-        // Sort entry
-        new_tables.sort_by_key(|elem| elem.sort_key());
-
-        debug_assert_eq!(new_tables.len() + clear.len() - new_len, origin.len());
-        new_tables
+        Ok(CompactTask {
+            low_lv,
+            high_lv,
+            new: Vec::new(),
+        })
     }
+
+    // Get new iterator iterating all tables waiting to compact
+    // Newest kv should be iterated first,
+    // so high level should be iterated first,
+    // low level should be iterated in reverse order (level 0 may overlaps)
+    #[inline]
+    pub fn tables(&self) -> impl Iterator<Item = &Arc<SSTableEntry>> {
+        self.high_lv
+            .tables
+            .iter()
+            .chain(self.low_lv.tables.iter().rev())
+    }
+
+    // Get compact target level
+    #[inline]
+    pub fn compact_size(&self) -> usize {
+        debug_assert!(self.high_lv.lv > 0);
+        // 10^L MB
+        (10_usize * 1024 * 1024).pow(self.high_lv.lv as u32)
+    }
+
+    // Add new compact result
+    #[inline]
+    pub fn add_compact_result(&mut self, entry: SSTableEntry) {
+        self.new.push(entry);
+    }
+}
+
+// Clear "clear" in "origin" and add "new" into "origin"
+fn merge_tables(
+    origin: &Vec<Arc<SSTableEntry>>,
+    clear: &Vec<Arc<SSTableEntry>>,
+    new: Vec<SSTableEntry>,
+) -> Vec<Arc<SSTableEntry>> {
+    let new_len = new.len();
+    let mut new_tables = Vec::with_capacity(origin.len() + clear.len() - new_len);
+
+    // Clear old data
+    for entry in origin.iter() {
+        let mut hold_on = true;
+        for old_entry in clear.iter() {
+            if entry.uid == old_entry.uid {
+                hold_on = false;
+                break;
+            }
+        }
+        if hold_on {
+            new_tables.push(Arc::clone(entry));
+        }
+    }
+
+    // Add new data
+    for entry in new {
+        new_tables.push(Arc::new(entry));
+    }
+
+    // Sort entry
+    new_tables.sort_by_key(|elem| elem.sort_key());
+
+    debug_assert_eq!(new_tables.len() + clear.len() - new_len, origin.len());
+    new_tables
 }
 
 #[inline]
@@ -522,10 +641,13 @@ mod tests {
     fn test_manifest() {
         {
             let manifest = Manifest::open("./data").unwrap();
-            let mut new_entry = manifest.alloc_new_sstable_entry().unwrap();
+            let mut new_entry = manifest.alloc_new_sstable_entry();
             let mut entry_writer = new_entry.open_writer().unwrap();
             entry_writer.write_all(b"123123123123").unwrap();
-            new_entry.set_range((Bytes::from("123"), Bytes::from("456")));
+            new_entry.set_range(SSTableRange {
+                left: Bytes::from("123"),
+                right: Bytes::from("456"),
+            });
 
             manifest.add_new_sstable(new_entry).unwrap();
         }

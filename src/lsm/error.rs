@@ -30,6 +30,9 @@ pub enum Error {
     #[error("illegal sstable entry")]
     IllegalSSTableEntry,
 
+    #[error("sstable entry lock failed")]
+    SSTableEntryLockFailed,
+
     #[error("illegal manifest")]
     IllegalManifest,
 }

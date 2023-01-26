@@ -22,7 +22,7 @@ pub struct SSTable<R: Seek + Read> {
 }
 
 impl<R: Seek + Read> SSTable<R> {
-    fn open(mut reader: R) -> Result<Self> {
+    pub fn open(mut reader: R) -> Result<Self> {
         // Recover footer from file
         let footer_buffer = seek_and_read_buf(
             &mut reader,
@@ -322,36 +322,43 @@ pub struct SSTableBuilder<W: Write> {
     index_block: BlockBuilder,
     last_key: Vec<u8>,
     offset: u64,
+    complete_data_block_size: usize,
 }
 
 impl<W: Write> SSTableBuilder<W> {
-    fn new(writer: W) -> Self {
+    pub fn new(writer: W) -> Self {
         SSTableBuilder {
             writer,
             data_block: BlockBuilder::new(),
             index_block: BlockBuilder::new(),
             last_key: Vec::with_capacity(128),
             offset: 0,
+            complete_data_block_size: 0,
         }
     }
 
-    // Add a new key to sstable
-    fn add(&mut self, key: &[u8], value: Value) -> Result<()> {
+    // Add a new key to sstable and return size estimate
+    pub fn add(&mut self, key: &[u8], value: Value) -> Result<usize> {
         self.data_block.add(key, &value.to_bytes());
         self.last_key.clear();
-        self.last_key.extend_from_slice(&key);
+        self.last_key.extend_from_slice(key);
+
+        let block_size = self.data_block.size_estimate();
+        let complete_data_block_size = self.complete_data_block_size;
 
         // Flush if block size is bigger enough, add a index
-        if self.data_block.size_estimate() > BLOCK_DEFAULT_SIZE {
+        if block_size > BLOCK_DEFAULT_SIZE {
+            self.complete_data_block_size += block_size;
             let (offset, data_size) = self.flush_new_data_block()?;
             self.add_new_index(offset, data_size);
         }
 
-        Ok(())
+        // Return size estimate
+        Ok(complete_data_block_size + block_size + self.index_block.size_estimate())
     }
 
     // Finish a table construction
-    fn finish(&mut self) -> Result<()> {
+    pub fn finish(&mut self) -> Result<()> {
         // Append new data block if data_block is not empty
         if !self.data_block.is_empty() {
             let (offset, data_size) = self.flush_new_data_block()?;
@@ -374,6 +381,13 @@ impl<W: Write> SSTableBuilder<W> {
             .write_all(&Footer::new(index_offset, index_size).to_bytes())?;
 
         Ok(())
+    }
+
+    #[inline]
+    pub fn size_estimate(&self) -> usize {
+        self.complete_data_block_size
+            + self.data_block.size_estimate()
+            + self.index_block.size_estimate()
     }
 
     fn add_new_index(&mut self, offset: u64, data_size: usize) {

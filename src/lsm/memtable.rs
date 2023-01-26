@@ -327,12 +327,10 @@ mod tests {
         {
             if is_deleted.first().unwrap() % 2 == 0 {
                 assert!(matches!(memtable.get(key).unwrap(), Value::Tombstone));
+            } else if let Some(Value::Living(v)) = memtable.get(key) {
+                assert_eq!(value, &v);
             } else {
-                if let Some(Value::Living(v)) = memtable.get(key) {
-                    assert_eq!(value, &v);
-                } else {
-                    panic!("value not found or not match");
-                }
+                panic!("value not found or not match");
             }
         }
 

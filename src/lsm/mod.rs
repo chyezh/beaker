@@ -2,6 +2,7 @@ mod error;
 pub use error::Error;
 
 mod block;
+mod compact;
 mod manifest;
 mod memtable;
 mod record;
