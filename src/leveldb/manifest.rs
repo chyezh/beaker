@@ -142,7 +142,10 @@ impl SSTableEntry {
             uid,
             root_path,
             compact_lock: AtomicU8::new(0),
-            range: SSTableRange::default(),
+            range: SSTableRange {
+                left: left_boundary,
+                right: right_boundary,
+            },
         })
     }
 
@@ -452,6 +455,11 @@ impl Manifest {
         // Write new version in memory
         let mut manifest = RwLockUpgradableReadGuard::upgrade(manifest);
         *manifest = new_manifest;
+
+        // Clear old files
+        for table in task.low_lv.tables.iter().chain(task.high_lv.tables.iter()) {
+            fs::remove_file(SSTableEntry::file_path(table.root_path.clone(), &table.uid)).ok();
+        }
 
         Ok(())
     }
