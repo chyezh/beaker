@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use uuid::Uuid;
 
-use crate::lsm::record::RecordReader;
+use crate::leveldb::record::RecordReader;
 use crate::util::{from_le_bytes_32, from_le_bytes_64};
 
 use super::record::RecordWriter;

@@ -1,6 +1,6 @@
 mod cmd;
 mod engine;
-mod lsm;
+mod leveldb;
 mod raft;
 mod resp;
 mod server;
