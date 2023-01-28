@@ -6,12 +6,16 @@ use bytes::Bytes;
 use std::fs::File;
 use std::io::{Read, Seek};
 
-struct Compactor<'a> {
+pub struct Compactor {
     task: CompactTask,
-    manifest: &'a Manifest,
+    manifest: Manifest,
 }
 
-impl<'a> Compactor<'a> {
+impl Compactor {
+    pub fn new(task: CompactTask, manifest: Manifest) -> Self {
+        Compactor { task, manifest }
+    }
+
     // Do the compact operation
     pub fn compact(mut self) -> Result<()> {
         let compact_size = self.task.compact_size();
@@ -33,7 +37,7 @@ impl<'a> Compactor<'a> {
                 continue;
             }
 
-            let size = new_entry.as_mut().unwrap().1.add(&key, value)?;
+            let size = new_entry.as_mut().unwrap().1.add(key, value)?;
             if size >= compact_size {
                 // Finish one compaction
                 new_entry.as_mut().unwrap().1.finish()?;

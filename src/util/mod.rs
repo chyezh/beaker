@@ -93,3 +93,12 @@ pub fn generate_random_bytes(num: usize, max_len: usize) -> Vec<Bytes> {
     }
     v
 }
+
+#[cfg(test)]
+pub fn generate_step_by_bytes(num: usize) -> Vec<Bytes> {
+    let mut v = Vec::with_capacity(num);
+    for i in 0..num {
+        v.push(Bytes::from(i.to_string()));
+    }
+    v
+}

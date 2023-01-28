@@ -1,10 +1,12 @@
 use bytes::Bytes;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
 use crate::leveldb::record::RecordReader;
 use crate::util::{from_le_bytes_32, from_le_bytes_64};
 
 use super::record::RecordWriter;
+use super::sstable::SSTableRange;
 use super::util::scan_sorted_file_at_path;
 use super::{Error, Result};
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
@@ -19,47 +21,6 @@ const MANIFEST_FILE_EXTENSION: &str = "manifest";
 const MINIMUM_SSTABLE_ENTRY_SIZE: usize = 28;
 const MINIMUM_MANIFEST_INNER_SIZE: usize = 8;
 const SPLIT_MANIFEST_SIZE_THRESHOLD: usize = 32 * 1024 * 1024; // 32MB
-
-#[derive(Debug, Default, Clone)]
-struct SSTableRange {
-    left: Bytes,
-    right: Bytes,
-}
-
-impl SSTableRange {
-    // Merge two overlap range
-    fn merge_if_overlap(&mut self, other: &SSTableRange) {
-        if self.is_overlap(other) {
-            if self.left > other.left {
-                self.left = other.left.clone()
-            }
-            if self.right < other.right {
-                self.right = other.right.clone()
-            }
-        }
-    }
-
-    // Check if two range is overlapping
-    fn is_overlap(&self, other: &SSTableRange) -> bool {
-        !(self.right < other.left || self.left > other.right)
-    }
-
-    // Check if a key in this range
-    fn in_range(&self, key: &[u8]) -> bool {
-        key >= self.left && key <= self.right
-    }
-
-    // Order with given key
-    fn order(&self, key: &[u8]) -> std::cmp::Ordering {
-        if key < self.left {
-            std::cmp::Ordering::Less
-        } else if key > self.right {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    }
-}
 
 pub struct SSTableEntry {
     lv: usize,
@@ -270,6 +231,15 @@ impl ManifestInner {
     }
 }
 
+impl Default for ManifestInner {
+    fn default() -> Self {
+        ManifestInner {
+            version: 0,
+            tables: vec![Vec::new()], // Create level 0 tables
+        }
+    }
+}
+
 struct ManifestPersister {
     log: RecordWriter<File>,
     root_path: PathBuf,
@@ -301,7 +271,7 @@ impl ManifestPersister {
 
         // Write manifest information
         let mut buffer = Vec::with_capacity(manifest.encode_bytes_len());
-        manifest.encode_to(&mut buffer);
+        manifest.encode_to(&mut buffer)?;
         self.log.append(buffer.into())?;
 
         // TODO: clear old manifest file
@@ -312,13 +282,14 @@ impl ManifestPersister {
 #[derive(Clone)]
 pub struct Manifest {
     inner: Arc<RwLock<ManifestInner>>,
-    root_path: PathBuf,
     persister: Arc<Mutex<ManifestPersister>>,
+    root_path: PathBuf,
+    compact_tx: UnboundedSender<()>,
 }
 
 impl Manifest {
     // Open a new manifest record
-    pub fn open(root_path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn open(root_path: impl Into<PathBuf>) -> Result<(Self, UnboundedReceiver<()>)> {
         // Try to create manifest root directory
         let root_path: PathBuf = root_path.into();
         fs::create_dir_all(sstable_root_path(&root_path))?;
@@ -349,35 +320,27 @@ impl Manifest {
                         ManifestInner::decode_from_bytes(sstable_root_path(&root_path), data)?;
                     (inner, manifest_files.last().unwrap().1 + 1)
                 }
-                None => {
-                    (
-                        ManifestInner {
-                            version: 0,
-                            tables: vec![Vec::new()], // Create level 0 tables
-                        },
-                        0,
-                    )
-                }
+                None => (ManifestInner::default(), 0),
             }
         } else {
             // Empty manifest root path, create new empty manifest
-            (
-                ManifestInner {
-                    version: 0,
-                    tables: vec![Vec::new()], // Create level 0 tables
-                },
-                0,
-            )
+            (ManifestInner::default(), 0)
         };
         // Open new persister
         let persister = ManifestPersister::open(manifest_root_path(&root_path), next_log_seq)?;
 
+        let (compact_tx, rx) = unbounded_channel();
+
         // TODO: Add manifest cleaner
-        Ok(Manifest {
-            inner: Arc::new(RwLock::new(inner)),
-            root_path,
-            persister: Arc::new(Mutex::new(persister)),
-        })
+        Ok((
+            Manifest {
+                inner: Arc::new(RwLock::new(inner)),
+                root_path,
+                persister: Arc::new(Mutex::new(persister)),
+                compact_tx,
+            },
+            rx,
+        ))
     }
 
     // Alloc a new sstable entry, and return its writer
@@ -411,6 +374,8 @@ impl Manifest {
         let mut manifest = RwLockUpgradableReadGuard::upgrade(manifest);
         *manifest = new_manifest;
 
+        // Trigger to find a compact task
+        self.compact_tx.send(()).unwrap();
         Ok(())
     }
 
@@ -477,6 +442,8 @@ impl Manifest {
             fs::remove_file(SSTableEntry::file_path(table.root_path.clone(), &table.uid)).ok();
         }
 
+        // Trigger to find new compact task
+        self.compact_tx.send(()).unwrap();
         Ok(())
     }
 
@@ -488,7 +455,7 @@ impl Manifest {
         // Max sstable count may be count of non-zero-level + count of sstable in level 0 (level 0 may overlap)
         let mut may_len = manifest.tables.len();
         if let Some(lv0) = manifest.tables.first() {
-            may_len += lv0.len() - 1;
+            may_len += lv0.len();
         }
         let mut sstables = Vec::with_capacity(may_len);
 
@@ -512,7 +479,8 @@ impl Manifest {
         sstables
     }
 
-    fn find_new_compact_tasks(&self) -> Vec<CompactTask> {
+    // Find new compaction task
+    pub fn find_new_compact_tasks(&self) -> Vec<CompactTask> {
         let manifest = self.inner.read();
         let mut tasks = Vec::new();
 
@@ -707,7 +675,7 @@ mod tests {
     #[test]
     fn test_manifest() {
         {
-            let manifest = Manifest::open("./data").unwrap();
+            let (manifest, _) = Manifest::open("./data").unwrap();
             let mut new_entry = manifest.alloc_new_sstable_entry();
             let mut entry_writer = new_entry.open_writer().unwrap();
             entry_writer.write_all(b"123123123123").unwrap();
@@ -720,7 +688,7 @@ mod tests {
         }
 
         {
-            let manifest = Manifest::open("./data").unwrap();
+            let (manifest, _) = Manifest::open("./data").unwrap();
             assert_eq!(manifest.inner.read().tables[0].len(), 1);
         }
     }

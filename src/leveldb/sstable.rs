@@ -15,10 +15,51 @@ use std::{
 const FOOTER_SIZE: usize = 12; // 12bytes
 const BLOCK_DEFAULT_SIZE: usize = 4 * 1024; // 4kb
 
+#[derive(Debug, Default, Clone)]
+pub struct SSTableRange {
+    pub left: Bytes,
+    pub right: Bytes,
+}
+
+impl SSTableRange {
+    // Merge two overlap range
+    pub fn merge_if_overlap(&mut self, other: &SSTableRange) {
+        if self.is_overlap(other) {
+            if self.left > other.left {
+                self.left = other.left.clone()
+            }
+            if self.right < other.right {
+                self.right = other.right.clone()
+            }
+        }
+    }
+
+    // Check if two range is overlapping
+    pub fn is_overlap(&self, other: &SSTableRange) -> bool {
+        !(self.right < other.left || self.left > other.right)
+    }
+
+    // Check if a key in this range
+    pub fn in_range(&self, key: &[u8]) -> bool {
+        key >= self.left && key <= self.right
+    }
+
+    // Order with given key
+    pub fn order(&self, key: &[u8]) -> std::cmp::Ordering {
+        if key < self.left {
+            std::cmp::Ordering::Less
+        } else if key > self.right {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }
+}
+
 pub struct SSTable<R: Seek + Read> {
     index: Index,
     reader: Arc<Mutex<Option<R>>>,
-    range: (Bytes, Bytes), // Key range of this table [xxx, xxx]
+    range: SSTableRange, // Key range of this table [xxx, xxx]
 }
 
 impl<R: Seek + Read> SSTable<R> {
@@ -98,13 +139,16 @@ impl<R: Seek + Read> SSTable<R> {
         Ok(SSTable {
             index,
             reader: Arc::new(Mutex::new(Some(reader))),
-            range: (first_key, last_key),
+            range: SSTableRange {
+                left: first_key,
+                right: last_key,
+            },
         })
     }
 
     pub fn search(&self, key: &[u8]) -> Result<Option<Value>> {
         debug_assert!(self.reader.lock().unwrap().is_some());
-        if !self.in_range(key) {
+        if !self.range.in_range(key) {
             return Ok(None);
         }
 
@@ -130,10 +174,6 @@ impl<R: Seek + Read> SSTable<R> {
             return Ok(Some(Value::decode_from_bytes(value)?));
         }
         Ok(None)
-    }
-
-    fn in_range(&self, key: &[u8]) -> bool {
-        key >= &self.range.0[..] && key <= &self.range.1[..]
     }
 }
 
@@ -323,6 +363,7 @@ pub struct SSTableBuilder<W: Write> {
     last_key: Vec<u8>,
     offset: u64,
     complete_data_block_size: usize,
+    range: (Option<Bytes>, Option<Bytes>),
 }
 
 impl<W: Write> SSTableBuilder<W> {
@@ -334,14 +375,15 @@ impl<W: Write> SSTableBuilder<W> {
             last_key: Vec::with_capacity(128),
             offset: 0,
             complete_data_block_size: 0,
+            range: (None, None),
         }
     }
 
     // Add a new key to sstable and return size estimate
-    pub fn add(&mut self, key: &[u8], value: Value) -> Result<usize> {
-        self.data_block.add(key, &value.to_bytes());
+    pub fn add(&mut self, key: Bytes, value: Value) -> Result<usize> {
+        self.data_block.add(&key, &value.to_bytes());
         self.last_key.clear();
-        self.last_key.extend_from_slice(key);
+        self.last_key.extend_from_slice(&key);
 
         let block_size = self.data_block.size_estimate();
         let complete_data_block_size = self.complete_data_block_size;
@@ -353,12 +395,21 @@ impl<W: Write> SSTableBuilder<W> {
             self.add_new_index(offset, data_size);
         }
 
+        // Update range
+        if self.range.0.is_none() {
+            self.range.0 = Some(key.clone());
+        }
+        self.range.1 = Some(key);
+
         // Return size estimate
         Ok(complete_data_block_size + block_size + self.index_block.size_estimate())
     }
 
-    // Finish a table construction
-    pub fn finish(&mut self) -> Result<()> {
+    // Finish a table construction, and get the sstable range
+    pub fn finish(&mut self) -> Result<SSTableRange> {
+        debug_assert!(self.range.0.is_some());
+        debug_assert!(self.range.1.is_some());
+
         // Append new data block if data_block is not empty
         if !self.data_block.is_empty() {
             let (offset, data_size) = self.flush_new_data_block()?;
@@ -380,7 +431,10 @@ impl<W: Write> SSTableBuilder<W> {
         self.writer
             .write_all(&Footer::new(index_offset, index_size).to_bytes())?;
 
-        Ok(())
+        Ok(SSTableRange {
+            left: self.range.0.as_ref().unwrap().clone(),
+            right: self.range.1.as_ref().unwrap().clone(),
+        })
     }
 
     #[inline]
@@ -420,7 +474,7 @@ mod tests {
 
     use super::*;
     use bytes::Bytes;
-    use std::{collections::HashMap, io::Cursor};
+    use std::io::Cursor;
 
     #[test]
     fn test_table_build_and_search_with_random_case() {
@@ -498,7 +552,9 @@ mod tests {
         // Build up table
         let mut builder = SSTableBuilder::new(Vec::new());
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            builder.add(key, Value::living(value.clone())).unwrap();
+            builder
+                .add(key.clone(), Value::living(value.clone()))
+                .unwrap();
         }
         builder.finish().unwrap();
 
@@ -516,20 +572,38 @@ mod tests {
         let v = Vec::new();
         let mut builder = SSTableBuilder::new(v);
         builder
-            .add(b"123456789", Value::living_static(b"1234567689"))
+            .add(
+                Bytes::from_static(b"123456789"),
+                Value::living_static(b"1234567689"),
+            )
             .unwrap();
         builder
-            .add(b"1234567891", Value::living_static(b"1234567689"))
+            .add(
+                Bytes::from_static(b"1234567891"),
+                Value::living_static(b"1234567689"),
+            )
             .unwrap();
         builder
-            .add(b"12345678912", Value::living_static(b"1234567689"))
+            .add(
+                Bytes::from_static(b"12345678912"),
+                Value::living_static(b"1234567689"),
+            )
             .unwrap();
         builder
-            .add(b"12345678923", Value::living_static(b"1234567689"))
+            .add(
+                Bytes::from_static(b"12345678923"),
+                Value::living_static(b"1234567689"),
+            )
             .unwrap();
-        builder.add(b"2", Value::living_static(b"2")).unwrap();
-        builder.add(b"3", Value::living_static(b"3")).unwrap();
-        builder.add(b"4", Value::living_static(b"")).unwrap();
+        builder
+            .add(Bytes::from_static(b"2"), Value::living_static(b"2"))
+            .unwrap();
+        builder
+            .add(Bytes::from_static(b"3"), Value::living_static(b"3"))
+            .unwrap();
+        builder
+            .add(Bytes::from_static(b"4"), Value::living_static(b""))
+            .unwrap();
         builder.finish().unwrap();
 
         let v = Cursor::new(builder.writer);

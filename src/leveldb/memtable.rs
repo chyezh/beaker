@@ -188,16 +188,24 @@ pub struct DumpRequest {
 }
 
 impl DumpRequest {
+    #[inline]
     fn new(table: Arc<KVTable>, tx: UnboundedSender<PathBuf>) -> Self {
         DumpRequest { table, tx }
     }
 
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.table.entries.len()
+    }
+
     // Consume the request
+    #[inline]
     pub fn ok(self) {
         self.tx.send(self.table.path.clone()).unwrap();
     }
 
     // Get iterator of the table
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &Value)> {
         self.table.entries.iter()
     }
