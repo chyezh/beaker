@@ -3,6 +3,7 @@ pub use error::Error;
 
 mod block;
 mod compact;
+mod db;
 mod manifest;
 mod memtable;
 mod record;

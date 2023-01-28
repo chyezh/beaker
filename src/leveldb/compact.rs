@@ -15,6 +15,7 @@ impl<'a> Compactor<'a> {
     // Do the compact operation
     pub fn compact(mut self) -> Result<()> {
         let compact_size = self.task.compact_size();
+        let erase_tombstone = self.task.need_erase_tombstone();
         let mut new_entry: Option<(SSTableEntry, SSTableBuilder<File>)> = None;
 
         for element in self.open_all_sstable()? {
@@ -26,6 +27,12 @@ impl<'a> Compactor<'a> {
             }
 
             let (key, value) = element?;
+
+            // Skip tombstone if erase tombstone option is set
+            if erase_tombstone && value.is_tombstone() {
+                continue;
+            }
+
             let size = new_entry.as_mut().unwrap().1.add(&key, value)?;
             if size >= compact_size {
                 // Finish one compaction

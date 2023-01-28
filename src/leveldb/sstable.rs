@@ -102,7 +102,7 @@ impl<R: Seek + Read> SSTable<R> {
         })
     }
 
-    pub fn search_key(&self, key: &[u8]) -> Result<Option<Value>> {
+    pub fn search(&self, key: &[u8]) -> Result<Option<Value>> {
         debug_assert!(self.reader.lock().unwrap().is_some());
         if !self.in_range(key) {
             return Ok(None);
@@ -427,7 +427,7 @@ mod tests {
         let (test_case_key, test_case_value, mut table) = create_new_table_with_random_case(1000);
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             assert_eq!(
-                table.search_key(key).unwrap().unwrap(),
+                table.search(key).unwrap().unwrap(),
                 Value::living(value.clone())
             );
         }
@@ -439,7 +439,7 @@ mod tests {
             create_new_table_with_random_case(1500);
         for (key, value) in test_case_key_1.iter().zip(test_case_value_1.iter()) {
             assert_eq!(
-                table_1.search_key(key).unwrap().unwrap(),
+                table_1.search(key).unwrap().unwrap(),
                 Value::living(value.clone())
             );
         }
@@ -448,7 +448,7 @@ mod tests {
             create_new_table_with_random_case(1000);
         for (key, value) in test_case_key_2.iter().zip(test_case_value_2.iter()) {
             assert_eq!(
-                table_2.search_key(key).unwrap().unwrap(),
+                table_2.search(key).unwrap().unwrap(),
                 Value::living(value.clone())
             );
         }
@@ -535,23 +535,23 @@ mod tests {
         let v = Cursor::new(builder.writer);
         let mut table = SSTable::open(v).unwrap();
 
-        let result = table.search_key(b"123456789").unwrap().unwrap();
+        let result = table.search(b"123456789").unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search_key(b"1234567891").unwrap().unwrap();
+        let result = table.search(b"1234567891").unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search_key(b"12345678912").unwrap().unwrap();
+        let result = table.search(b"12345678912").unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search_key(b"12345678923").unwrap().unwrap();
+        let result = table.search(b"12345678923").unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search_key(b"2").unwrap().unwrap();
+        let result = table.search(b"2").unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"2"));
-        let result = table.search_key(b"3").unwrap().unwrap();
+        let result = table.search(b"3").unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"3"));
-        let result = table.search_key(b"4").unwrap().unwrap();
+        let result = table.search(b"4").unwrap().unwrap();
         assert_eq!(result, Value::living_static(b""));
-        assert!(table.search_key(b"1000").unwrap().is_none());
-        assert!(table.search_key(b"1").unwrap().is_none());
-        assert!(table.search_key(b"666").unwrap().is_none());
-        assert!(table.search_key(b"5").unwrap().is_none());
+        assert!(table.search(b"1000").unwrap().is_none());
+        assert!(table.search(b"1").unwrap().is_none());
+        assert!(table.search(b"666").unwrap().is_none());
+        assert!(table.search(b"5").unwrap().is_none());
     }
 }

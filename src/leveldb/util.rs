@@ -79,6 +79,11 @@ impl Value {
         };
         Ok(())
     }
+
+    #[inline]
+    pub fn is_tombstone(&self) -> bool {
+        matches!(self, Value::Tombstone)
+    }
 }
 
 // Scan given directory and get all sorted file with given extension

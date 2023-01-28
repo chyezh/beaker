@@ -43,6 +43,22 @@ impl SSTableRange {
     fn is_overlap(&self, other: &SSTableRange) -> bool {
         !(self.right < other.left || self.left > other.right)
     }
+
+    // Check if a key in this range
+    fn in_range(&self, key: &[u8]) -> bool {
+        key >= self.left && key <= self.right
+    }
+
+    // Order with given key
+    fn order(&self, key: &[u8]) -> std::cmp::Ordering {
+        if key < self.left {
+            std::cmp::Ordering::Less
+        } else if key > self.right {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }
 }
 
 pub struct SSTableEntry {
@@ -464,6 +480,38 @@ impl Manifest {
         Ok(())
     }
 
+    // Create iterator iterating all sstable which may contain key
+    pub fn search(&self, key: &[u8]) -> Vec<Arc<SSTableEntry>> {
+        // Read a manifest snapshot
+        let manifest = self.inner.read();
+
+        // Max sstable count may be count of non-zero-level + count of sstable in level 0 (level 0 may overlap)
+        let mut may_len = manifest.tables.len();
+        if let Some(lv0) = manifest.tables.first() {
+            may_len += lv0.len() - 1;
+        }
+        let mut sstables = Vec::with_capacity(may_len);
+
+        // Search sstable from young level to old level
+        for (lv, tables) in manifest.tables.iter().enumerate() {
+            if lv == 0 {
+                // Level 0 may overlap, need to iterate all sstable in reverse order
+                for table in tables.iter().rev() {
+                    if table.range.in_range(key) {
+                        sstables.push(table.clone());
+                    }
+                }
+            } else {
+                // Other level never overlap, binary search
+                if let Ok(idx) = tables.binary_search_by(|probe| probe.range.order(key)) {
+                    sstables.push(tables[idx].clone());
+                }
+            }
+        }
+
+        sstables
+    }
+
     fn find_new_compact_tasks(&self) -> Vec<CompactTask> {
         let manifest = self.inner.read();
         let mut tasks = Vec::new();
@@ -473,7 +521,11 @@ impl Manifest {
             // Try to compact if other level tables count is gte 10
             if (lv == 0 && tables.len() >= 4) || tables.len() >= 10 {
                 for (idx, _) in tables.iter().enumerate() {
-                    if let Ok(task) = CompactTask::new(&manifest, lv, idx) {
+                    if let Ok(mut task) = CompactTask::new(&manifest, lv, idx) {
+                        // The greatest two level should erase tombstone
+                        if lv + 2 >= tables.len() {
+                            task.erase_tombstone = true
+                        }
                         tasks.push(task);
                         // Generate one task for every level
                         break;
@@ -502,6 +554,7 @@ impl Drop for CompactSSTables {
 }
 
 pub struct CompactTask {
+    erase_tombstone: bool,
     low_lv: CompactSSTables,
     high_lv: CompactSSTables,
     new: Vec<SSTableEntry>,
@@ -551,6 +604,7 @@ impl CompactTask {
         }
 
         Ok(CompactTask {
+            erase_tombstone: false,
             low_lv,
             high_lv,
             new: Vec::new(),
@@ -581,6 +635,11 @@ impl CompactTask {
     #[inline]
     pub fn add_compact_result(&mut self, entry: SSTableEntry) {
         self.new.push(entry);
+    }
+
+    #[inline]
+    pub fn need_erase_tombstone(&self) -> bool {
+        self.erase_tombstone
     }
 }
 

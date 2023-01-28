@@ -100,7 +100,7 @@ impl MemTable {
     }
 
     // Get the value by key
-    pub fn get(&self, key: &Bytes) -> Option<Value> {
+    pub fn get(&self, key: &[u8]) -> Option<Value> {
         // Read mutable first
         if let Some(value) = self.mutable.lock().entries.get(key) {
             return Some(value.clone());
@@ -193,12 +193,12 @@ impl DumpRequest {
     }
 
     // Consume the request
-    fn ok(self) {
-        self.tx.send(self.table.path.clone());
+    pub fn ok(self) {
+        self.tx.send(self.table.path.clone()).unwrap();
     }
 
     // Get iterator of the table
-    fn iter(&self) -> impl Iterator<Item = (&Bytes, &Value)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &Value)> {
         self.table.entries.iter()
     }
 }
