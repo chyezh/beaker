@@ -2,6 +2,8 @@ use bytes::Bytes;
 use crc::{Crc, CRC_32_ISCSI};
 use std::io::{Read, Seek, SeekFrom};
 
+pub mod async_util;
+
 static CRC_INSTANCE: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 // Seek reader and read n exact bytes

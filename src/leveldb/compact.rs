@@ -40,14 +40,15 @@ impl Compactor {
             let size = new_entry.as_mut().unwrap().1.add(key, value)?;
             if size >= compact_size {
                 // Finish one compaction
-                new_entry.as_mut().unwrap().1.finish()?;
+                let range = new_entry.as_mut().unwrap().1.finish()?;
+                new_entry.as_mut().unwrap().0.set_range(range);
                 self.task.add_compact_result(new_entry.take().unwrap().0);
             }
         }
 
         // Finish remaining compaction
         if let Some(mut entry) = new_entry {
-            entry.1.finish()?;
+            entry.0.set_range(entry.1.finish()?);
             self.task.add_compact_result(entry.0);
         }
 

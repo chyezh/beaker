@@ -1,12 +1,10 @@
-use bytes::Bytes;
-
-use crate::util::from_le_bytes_32;
-
 use super::{
     record::{RecordReader, RecordWriter},
     util::{scan_sorted_file_at_path, Value},
     Error, Result,
 };
+use crate::util::from_le_bytes_32;
+use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -15,8 +13,8 @@ use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicU64, Ordering},
 };
-
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tracing::{debug, warn};
 
 const KV_HEADER: usize = 8; // key_len + value_len 4+4
 const SPLIT_LOG_SIZE_THRESHOLD: usize = 4 * 1024 * 1024; // 4M
@@ -171,8 +169,12 @@ impl MemTable {
                 let mut tables = immutable.write();
                 if let Some(first_table) = tables.first() {
                     if path == first_table.path {
-                        // TODO: remove should be log
-                        fs::remove_file(path).unwrap();
+                        if let Err(err) = fs::remove_file(path) {
+                            warn!(
+                                error = err.to_string(),
+                                "remove expired memtable file failed"
+                            );
+                        }
                         tables.remove(0);
                     }
                 }
@@ -182,6 +184,7 @@ impl MemTable {
 }
 
 // Ask to do a dump operation for a slice of memtable
+#[derive(Debug)]
 pub struct DumpRequest {
     table: Arc<KVTable>,
     tx: UnboundedSender<PathBuf>,
@@ -224,7 +227,7 @@ fn encode_kv(key: &[u8], value: &Value) -> Bytes {
     buffer.extend_from_slice(&value.encode_bytes_len().to_le_bytes()[0..4]);
     buffer.extend(key);
     // IO always success on Vec, ignore error
-    value.encode_to(&mut buffer);
+    value.encode_to(&mut buffer).ok();
 
     buffer.into()
 }
@@ -269,6 +272,7 @@ fn open_new_log(dir: &Path, log_seq: u64) -> Result<(File, PathBuf)> {
 
 // Implement kv table
 // TODO: replace by skip list in future
+#[derive(Debug)]
 struct KVTable {
     entries: BTreeMap<Bytes, Value>,
     log: Option<RecordWriter<File>>,
@@ -327,7 +331,7 @@ mod tests {
         }
 
         drop(memtable);
-        let mut memtable = MemTable::open("./data").unwrap();
+        let memtable = MemTable::open("./data").unwrap();
         for ((key, value), is_deleted) in test_case_key
             .iter()
             .zip(test_case_value.iter())

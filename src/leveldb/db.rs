@@ -1,16 +1,15 @@
-use std::path::PathBuf;
-
-use bytes::Bytes;
-
 use super::{
     compact::Compactor,
-    manifest::{CompactTask, Manifest},
+    manifest::Manifest,
     memtable::{DumpRequest, MemTable},
     sstable::{SSTable, SSTableBuilder},
     util::Value,
     Result,
 };
+use bytes::Bytes;
+use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tracing::{info, warn};
 
 pub struct DB {
     manifest: Manifest,
@@ -71,10 +70,19 @@ impl DB {
 // Listen the compact channel
 fn listen_compact(manifest: Manifest, mut listener: UnboundedReceiver<()>) {
     tokio::spawn(async move {
+        info!("compact task listening...");
         while let Some(()) = listener.recv().await {
+            info!("start find new compact task...");
             for task in manifest.find_new_compact_tasks() {
-                Compactor::new(task, manifest.clone()).compact().ok();
+                let manifest = manifest.clone();
+                info!("compact task found, {:?}", task);
+                tokio::spawn(async move {
+                    if let Err(err) = Compactor::new(task, manifest).compact() {
+                        warn!(error = err.to_string(), "compact task failed")
+                    }
+                });
             }
+            info!("finish find new compact task");
         }
     });
 }
@@ -82,10 +90,14 @@ fn listen_compact(manifest: Manifest, mut listener: UnboundedReceiver<()>) {
 // Listen the dump channel, dump memtable into sstable concurrently
 fn listen_dump(manifest: Manifest, mut listener: UnboundedReceiver<DumpRequest>) {
     tokio::spawn(async move {
+        info!("dump task listening...");
         while let Some(request) = listener.recv().await {
             let manifest = manifest.clone();
+            info!("dump request found");
             tokio::spawn(async move {
-                dump(&manifest, request).ok();
+                if let Err(err) = dump(&manifest, request) {
+                    warn!(error = err.to_string(), "dump memtable into sstable failed",)
+                }
             });
         }
     });
@@ -118,7 +130,8 @@ fn dump(manifest: &Manifest, request: DumpRequest) -> Result<()> {
 mod tests {
 
     use super::*;
-    use crate::util::{generate_random_bytes, generate_step_by_bytes};
+    use crate::util::generate_random_bytes;
+    use test_log::test;
 
     #[test]
     fn test_db_with_random_case() {
@@ -137,7 +150,6 @@ mod tests {
             db.set(key.clone(), value.clone()).unwrap();
         }
 
-        println!("start get");
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             assert_eq!(db.get(key).unwrap().unwrap(), value.clone());
         }
@@ -145,6 +157,7 @@ mod tests {
 
     #[test]
     fn test_db_with_step_case() {
+        tracing::warn!("start testing");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -152,17 +165,12 @@ mod tests {
         let _guard = runtime.enter();
 
         let test_count = 100000;
-        let test_case_key = generate_step_by_bytes(test_count);
-        let test_case_value = generate_step_by_bytes(test_count);
-
         let db = DB::open("./data").unwrap();
-        // for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-        //     db.set(key.clone(), value.clone()).unwrap();
-        // }
 
-        println!("start get");
-        for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            assert_eq!(db.get(key).unwrap().unwrap(), value.clone());
+        for i in 0..test_count {
+            let b = Bytes::from(i.to_string());
+            assert_eq!(db.get(&b).unwrap(), Some(b));
+            // db.set(b.clone(), b.clone()).unwrap();
         }
     }
 }

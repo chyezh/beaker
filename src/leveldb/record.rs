@@ -175,6 +175,7 @@ impl<R: Read> Iterator for RecordReader<R> {
 }
 
 // Implement a binary log Writer
+#[derive(Debug)]
 pub struct RecordWriter<W: Write> {
     writer: W,
     block_offset: usize,

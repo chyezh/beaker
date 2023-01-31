@@ -312,8 +312,8 @@ impl Footer {
     // Convert Footer into bytes
     fn to_bytes(&self) -> [u8; FOOTER_SIZE] {
         let mut new_index_value: [u8; FOOTER_SIZE] = [0; FOOTER_SIZE];
-        (&mut new_index_value[0..8]).copy_from_slice(&self.index_offset.to_le_bytes()[0..8]);
-        (&mut new_index_value[8..12]).copy_from_slice(&self.index_size.to_le_bytes()[0..4]);
+        new_index_value[0..8].copy_from_slice(&self.index_offset.to_le_bytes()[0..8]);
+        new_index_value[8..12].copy_from_slice(&self.index_size.to_le_bytes()[0..4]);
 
         new_index_value
     }

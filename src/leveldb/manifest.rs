@@ -1,20 +1,20 @@
-use bytes::Bytes;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use uuid::Uuid;
-
-use crate::leveldb::record::RecordReader;
-use crate::util::{from_le_bytes_32, from_le_bytes_64};
-
 use super::record::RecordWriter;
 use super::sstable::SSTableRange;
 use super::util::scan_sorted_file_at_path;
 use super::{Error, Result};
+use crate::leveldb::record::RecordReader;
+use crate::util::{from_le_bytes_32, from_le_bytes_64};
+use bytes::Bytes;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
+use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tracing::warn;
+use uuid::Uuid;
 
 const SSTABLE_FILE_EXTENSION: &str = "tbl";
 const MANIFEST_FILE_EXTENSION: &str = "manifest";
@@ -22,6 +22,7 @@ const MINIMUM_SSTABLE_ENTRY_SIZE: usize = 28;
 const MINIMUM_MANIFEST_INNER_SIZE: usize = 8;
 const SPLIT_MANIFEST_SIZE_THRESHOLD: usize = 32 * 1024 * 1024; // 32MB
 
+#[derive(Debug)]
 pub struct SSTableEntry {
     lv: usize,
     uid: Uuid,
@@ -263,10 +264,13 @@ impl ManifestPersister {
     // Persist given manifest info into file
     fn persist(&mut self, manifest: &ManifestInner) -> Result<()> {
         // Switch new file if needed
+        let mut need_clear = false;
         let total_write = self.log.written();
+        let next_log_seq = self.next_log_seq;
         if total_write > SPLIT_MANIFEST_SIZE_THRESHOLD {
-            self.log = RecordWriter::new(open_new_manifest(&self.root_path, self.next_log_seq)?);
+            self.log = RecordWriter::new(open_new_manifest(&self.root_path, next_log_seq)?);
             self.next_log_seq += 1;
+            need_clear = true;
         }
 
         // Write manifest information
@@ -274,8 +278,32 @@ impl ManifestPersister {
         manifest.encode_to(&mut buffer)?;
         self.log.append(buffer.into())?;
 
-        // TODO: clear old manifest file
+        // Try to remove old manifest
+        if need_clear {
+            self.clear_old_manifest(next_log_seq);
+        }
+
         Ok(())
+    }
+
+    // Remove all old manifest
+    fn clear_old_manifest(&self, seq: u64) {
+        // Scan root_path, clear log expired
+        if let Ok(files) =
+            scan_sorted_file_at_path(self.root_path.as_path(), MANIFEST_FILE_EXTENSION)
+        {
+            for (path, i) in files {
+                if i < seq {
+                    if let Err(err) = fs::remove_file(path) {
+                        warn!(
+                            error = err.to_string(),
+                            log_seq = i,
+                            "remove expired manifest file failed",
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -331,7 +359,6 @@ impl Manifest {
 
         let (compact_tx, rx) = unbounded_channel();
 
-        // TODO: Add manifest cleaner
         Ok((
             Manifest {
                 inner: Arc::new(RwLock::new(inner)),
@@ -439,7 +466,14 @@ impl Manifest {
 
         // Clear old files
         for table in task.low_lv.tables.iter().chain(task.high_lv.tables.iter()) {
-            fs::remove_file(SSTableEntry::file_path(table.root_path.clone(), &table.uid)).ok();
+            if let Err(err) =
+                fs::remove_file(SSTableEntry::file_path(table.root_path.clone(), &table.uid))
+            {
+                warn!(
+                    error = err.to_string(),
+                    "remove old expired sstable file failed"
+                );
+            }
         }
 
         // Trigger to find new compact task
@@ -495,8 +529,6 @@ impl Manifest {
                             task.erase_tombstone = true
                         }
                         tasks.push(task);
-                        // Generate one task for every level
-                        break;
                     }
                 }
             }
@@ -506,6 +538,7 @@ impl Manifest {
     }
 }
 
+#[derive(Debug)]
 pub struct CompactSSTables {
     tables: Vec<Arc<SSTableEntry>>,
     lv: usize,
@@ -521,6 +554,7 @@ impl Drop for CompactSSTables {
     }
 }
 
+#[derive(Debug)]
 pub struct CompactTask {
     erase_tombstone: bool,
     low_lv: CompactSSTables,
@@ -566,8 +600,11 @@ impl CompactTask {
             for other in tables.iter() {
                 // Overlap found, try lock
                 // High level range never overlap with each other, no range merge needed
-                other.try_compact_lock()?;
-                high_lv.tables.push(other.clone());
+                if range.is_overlap(&other.range) {
+                    other.try_compact_lock()?;
+                    high_lv.tables.push(other.clone());
+                    range.merge_if_overlap(&other.range);
+                }
             }
         }
 
@@ -618,7 +655,7 @@ fn merge_tables(
     new: Vec<SSTableEntry>,
 ) -> Vec<Arc<SSTableEntry>> {
     let new_len = new.len();
-    let mut new_tables = Vec::with_capacity(origin.len() + clear.len() - new_len);
+    let mut new_tables = Vec::with_capacity(origin.len() - clear.len() + new_len);
 
     // Clear old data
     for entry in origin.iter() {
@@ -671,6 +708,7 @@ fn open_new_manifest(dir: &Path, seq: u64) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_log::test;
 
     #[test]
     fn test_manifest() {
