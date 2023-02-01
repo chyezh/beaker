@@ -22,8 +22,8 @@ pub struct SSTableRange {
 }
 
 impl SSTableRange {
-    // Merge two overlap range
-    pub fn merge_if_overlap(&mut self, other: &SSTableRange) {
+    // Get minimum contain two range
+    pub fn get_minimum_contain(&mut self, other: &SSTableRange) {
         if self.is_overlap(other) {
             if self.left > other.left {
                 self.left = other.left.clone()
@@ -161,7 +161,7 @@ impl<R: Seek + Read> SSTable<R> {
 
         let block_info = &self.index.index[search_index];
         let block_buffer = seek_and_read_buf(
-            (&mut *self.reader.lock().unwrap()).as_mut().unwrap(),
+            (*self.reader.lock().unwrap()).as_mut().unwrap(),
             SeekFrom::Start(block_info.offset),
             block_info.size,
         )?;

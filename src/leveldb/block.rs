@@ -84,7 +84,7 @@ impl BlockBuilder {
 
         // build kv field
         self.buffer.extend_from_slice(&key[shared_prefix_count..]);
-        self.buffer.extend_from_slice(&value);
+        self.buffer.extend_from_slice(value);
 
         self.last_key.resize(shared_prefix_count, b'\x00');
         self.last_key.extend_from_slice(&key[shared_prefix_count..]);
@@ -146,7 +146,7 @@ impl Block {
     pub fn search_key(&self, key: &[u8]) -> Result<Option<Bytes>> {
         for pair in self.iter() {
             let (current_key, value) = pair?;
-            match (&current_key[..]).cmp(key) {
+            match current_key[..].cmp(key) {
                 Ordering::Equal => return Ok(Some(value)),
                 // KV Items are sorted, return None immediately if current key is lexicographic greater than target key
                 Ordering::Greater => return Ok(None),

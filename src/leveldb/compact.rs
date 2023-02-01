@@ -20,12 +20,13 @@ impl Compactor {
     pub fn compact(mut self) -> Result<()> {
         let compact_size = self.task.compact_size();
         let erase_tombstone = self.task.need_erase_tombstone();
+        let target_lv = self.task.target_lv();
         let mut new_entry: Option<(SSTableEntry, SSTableBuilder<File>)> = None;
 
         for element in self.open_all_sstable()? {
             if new_entry.is_none() {
                 // Start a new builder
-                let entry = self.manifest.alloc_new_sstable_entry();
+                let entry = self.manifest.alloc_new_sstable_entry(target_lv);
                 let builder = SSTableBuilder::new(entry.open_writer()?);
                 new_entry = Some((entry, builder));
             }

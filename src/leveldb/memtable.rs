@@ -5,7 +5,7 @@ use super::{
 };
 use crate::util::from_le_bytes_32;
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,20 +20,19 @@ const KV_HEADER: usize = 8; // key_len + value_len 4+4
 const SPLIT_LOG_SIZE_THRESHOLD: usize = 4 * 1024 * 1024; // 4M
 const LOG_FILE_EXTENSION: &str = "log";
 
+#[derive(Clone)]
 // Implement a memtable with persist write-ahead-log file
 pub struct MemTable {
     mutable: Arc<Mutex<KVTable>>,
     immutable: Arc<RwLock<Vec<Arc<KVTable>>>>,
     root_path: PathBuf,
-    next_log_seq: AtomicU64,
+    next_log_seq: Arc<AtomicU64>,
 
     dump_tx: UnboundedSender<DumpRequest>,
-    dump_rx: Option<UnboundedReceiver<DumpRequest>>,
-    dump_finish_tx: UnboundedSender<PathBuf>,
 }
 
 impl MemTable {
-    pub fn open(root_path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn open(root_path: impl Into<PathBuf>) -> Result<(Self, UnboundedReceiver<DumpRequest>)> {
         // Try to create log root directory at this path.
         let root_path: PathBuf = root_path.into();
         fs::create_dir_all(root_path.as_path())?;
@@ -62,7 +61,7 @@ impl MemTable {
                 let immutable_table = Arc::new(table);
                 tables.push(Arc::clone(&immutable_table));
                 // Ask to dump the immutable memtable
-                let send_result = tx.send(DumpRequest::new(immutable_table, finish_tx.clone()));
+                let send_result = tx.send(DumpRequest::new(immutable_table));
                 debug_assert!(send_result.is_ok());
             }
             (tables, log_files.last().unwrap().1 + 1)
@@ -81,20 +80,11 @@ impl MemTable {
             mutable: Arc::new(Mutex::new(mutable)),
             immutable: Arc::new(RwLock::new(immutable)),
             root_path,
-            next_log_seq: AtomicU64::new(next_log_seq),
+            next_log_seq: Arc::new(AtomicU64::new(next_log_seq)),
             dump_tx: tx,
-            dump_rx: Some(rx),
-            dump_finish_tx: finish_tx,
         };
 
-        // Start the memtable cleaner
-        table.start_cleaner(finish_rx);
-        Ok(table)
-    }
-
-    // Take the dump request receiver
-    pub fn take_dump_listener(&mut self) -> Option<UnboundedReceiver<DumpRequest>> {
-        self.dump_rx.take()
+        Ok((table, rx))
     }
 
     // Get the value by key
@@ -152,34 +142,38 @@ impl MemTable {
 
             // Send a dump request
             // Send operation would never fail
-            let result = self
-                .dump_tx
-                .send(DumpRequest::new(immutable, self.dump_finish_tx.clone()));
+            let result = self.dump_tx.send(DumpRequest::new(immutable));
             debug_assert!(result.is_ok());
         }
 
         Ok(())
     }
 
-    fn start_cleaner(&self, mut receiver: UnboundedReceiver<PathBuf>) {
+    // Clean the immutable memtable and corresponding log
+    pub fn clean_immutable(&self, path: &Path) {
         let immutable = Arc::clone(&self.immutable);
-        tokio::spawn(async move {
-            // Clear log file and remove memtable if dump is finished
-            while let Some(path) = receiver.recv().await {
-                let mut tables = immutable.write();
-                if let Some(first_table) = tables.first() {
-                    if path == first_table.path {
-                        if let Err(err) = fs::remove_file(path) {
-                            warn!(
-                                error = err.to_string(),
-                                "remove expired memtable file failed"
-                            );
-                        }
-                        tables.remove(0);
-                    }
+        let mut path_check_pass = false;
+        {
+            // Clear memtable if path check pass
+            let mut tables = immutable.write();
+            if let Some(first_table) = tables.first() {
+                if path == first_table.path {
+                    // remove immutable memtable
+                    tables.remove(0);
+                    path_check_pass = true;
                 }
             }
-        });
+        }
+
+        // remove old log if path check pass
+        if path_check_pass {
+            if let Err(err) = fs::remove_file(path) {
+                warn!(
+                    error = err.to_string(),
+                    "remove expired memtable file failed"
+                );
+            }
+        }
     }
 }
 
@@ -187,24 +181,22 @@ impl MemTable {
 #[derive(Debug)]
 pub struct DumpRequest {
     table: Arc<KVTable>,
-    tx: UnboundedSender<PathBuf>,
 }
 
 impl DumpRequest {
     #[inline]
-    fn new(table: Arc<KVTable>, tx: UnboundedSender<PathBuf>) -> Self {
-        DumpRequest { table, tx }
+    fn new(table: Arc<KVTable>) -> Self {
+        DumpRequest { table }
+    }
+
+    #[inline]
+    pub fn path(&self) -> &Path {
+        &self.table.path
     }
 
     #[inline]
     pub fn len(&self) -> usize {
         self.table.entries.len()
-    }
-
-    // Consume the request
-    #[inline]
-    pub fn ok(self) {
-        self.tx.send(self.table.path.clone()).unwrap();
     }
 
     // Get iterator of the table
@@ -305,7 +297,7 @@ mod tests {
         let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
 
         // Test normal value
-        let memtable = MemTable::open("./data").unwrap();
+        let (memtable, _) = MemTable::open("./data").unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             memtable
                 .set(key.clone(), Value::living(value.clone()))
@@ -313,7 +305,7 @@ mod tests {
         }
 
         drop(memtable);
-        let memtable = MemTable::open("./data").unwrap();
+        let (memtable, _) = MemTable::open("./data").unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             if let Some(Value::Living(v)) = memtable.get(key) {
                 assert_eq!(value, &v);
@@ -331,7 +323,7 @@ mod tests {
         }
 
         drop(memtable);
-        let memtable = MemTable::open("./data").unwrap();
+        let (memtable, _) = MemTable::open("./data").unwrap();
         for ((key, value), is_deleted) in test_case_key
             .iter()
             .zip(test_case_value.iter())
@@ -360,7 +352,7 @@ mod tests {
         }
 
         drop(memtable);
-        let memtable = MemTable::open("./data").unwrap();
+        let (memtable, _) = MemTable::open("./data").unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             if let Some(Value::Living(v)) = memtable.get(key) {
                 assert_eq!(value, &v);

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const SSTABLE_FILE_EXTENSION: &str = "tbl";
@@ -152,7 +152,7 @@ impl SSTableEntry {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct ManifestInner {
     version: u64,
     tables: Vec<Vec<Arc<SSTableEntry>>>,
@@ -232,15 +232,6 @@ impl ManifestInner {
     }
 }
 
-impl Default for ManifestInner {
-    fn default() -> Self {
-        ManifestInner {
-            version: 0,
-            tables: vec![Vec::new()], // Create level 0 tables
-        }
-    }
-}
-
 struct ManifestPersister {
     log: RecordWriter<File>,
     root_path: PathBuf,
@@ -280,20 +271,20 @@ impl ManifestPersister {
 
         // Try to remove old manifest
         if need_clear {
-            self.clear_old_manifest(next_log_seq);
+            self.clear_old_manifest();
         }
 
         Ok(())
     }
 
     // Remove all old manifest
-    fn clear_old_manifest(&self, seq: u64) {
+    fn clear_old_manifest(&self) {
         // Scan root_path, clear log expired
         if let Ok(files) =
             scan_sorted_file_at_path(self.root_path.as_path(), MANIFEST_FILE_EXTENSION)
         {
             for (path, i) in files {
-                if i < seq {
+                if i < self.next_log_seq - 1 {
                     if let Err(err) = fs::remove_file(path) {
                         warn!(
                             error = err.to_string(),
@@ -355,9 +346,12 @@ impl Manifest {
             (ManifestInner::default(), 0)
         };
         // Open new persister
-        let persister = ManifestPersister::open(manifest_root_path(&root_path), next_log_seq)?;
-
+        let mut persister = ManifestPersister::open(manifest_root_path(&root_path), next_log_seq)?;
         let (compact_tx, rx) = unbounded_channel();
+
+        // Persist manifest to the newest log and clear old manifest log
+        persister.persist(&inner)?;
+        persister.clear_old_manifest();
 
         Ok((
             Manifest {
@@ -371,12 +365,12 @@ impl Manifest {
     }
 
     // Alloc a new sstable entry, and return its writer
-    pub fn alloc_new_sstable_entry(&self) -> SSTableEntry {
+    pub fn alloc_new_sstable_entry(&self, lv: usize) -> SSTableEntry {
         let uid = Uuid::new_v4();
         SSTableEntry {
             uid,
             root_path: sstable_root_path(&self.root_path),
-            lv: 0,
+            lv,
             range: SSTableRange::default(),
             compact_lock: AtomicU8::new(0),
         }
@@ -390,7 +384,11 @@ impl Manifest {
 
         let manifest = self.inner.upgradable_read();
         let mut new_manifest = manifest.clone();
-        debug_assert!(!new_manifest.tables.is_empty());
+        if new_manifest.tables.is_empty() {
+            // Create level 0 if manifest is empty
+            new_manifest.tables = vec![Vec::new()];
+        }
+
         new_manifest.version += 1;
         new_manifest.tables[0].push(Arc::new(entry));
 
@@ -477,7 +475,9 @@ impl Manifest {
         }
 
         // Trigger to find new compact task
-        self.compact_tx.send(()).unwrap();
+        if let Err(e) = self.compact_tx.send(()) {
+            info!("receiver for compact trigger has been released");
+        }
         Ok(())
     }
 
@@ -524,11 +524,13 @@ impl Manifest {
             if (lv == 0 && tables.len() >= 4) || tables.len() >= 10 {
                 for (idx, _) in tables.iter().enumerate() {
                     if let Ok(mut task) = CompactTask::new(&manifest, lv, idx) {
-                        // The greatest two level should erase tombstone
-                        if lv + 2 >= tables.len() {
+                        // The compaction of greatest two level should erase tombstone
+                        if lv + 2 >= manifest.tables.len() {
                             task.erase_tombstone = true
                         }
                         tasks.push(task);
+                        // One compact task for one level
+                        break;
                     }
                 }
             }
@@ -583,6 +585,7 @@ impl CompactTask {
             lv: lv + 1,
         };
 
+        // Find all overlap sstable
         if lv == 0 {
             // Search overlap sstable in level-0
             for (i, other) in manifest.tables[0].iter().enumerate() {
@@ -590,7 +593,7 @@ impl CompactTask {
                     // Overlap found, try lock and merge range
                     other.try_compact_lock()?;
                     low_lv.tables.push(other.clone());
-                    range.merge_if_overlap(&other.range);
+                    range.get_minimum_contain(&other.range);
                 }
             }
         }
@@ -603,9 +606,48 @@ impl CompactTask {
                 if range.is_overlap(&other.range) {
                     other.try_compact_lock()?;
                     high_lv.tables.push(other.clone());
-                    range.merge_if_overlap(&other.range);
+                    range.get_minimum_contain(&other.range);
                 }
             }
+        }
+
+        // Add nearby low level sstable to join compact if file is not enough
+        if high_lv.tables.len() + low_lv.tables.len() <= 1 {
+            // Push left item
+            if idx > 0 {
+                let other = &manifest.tables[lv][idx - 1];
+                if other.try_compact_lock().is_ok() {
+                    low_lv.tables.insert(0, other.clone());
+                    range.get_minimum_contain(&other.range);
+                }
+            }
+
+            // Push right item
+            if idx < low_lv.tables.len() - 1 {
+                let other = &manifest.tables[lv][idx + 1];
+                if other.try_compact_lock().is_ok() {
+                    low_lv.tables.push(other.clone());
+                    range.get_minimum_contain(&other.range);
+                }
+            }
+
+            // Search overlap sstable in high level again
+            if let Some(tables) = manifest.tables.get(lv + 1) {
+                for other in tables.iter() {
+                    // Overlap found, try lock
+                    // High level range never overlap with each other, no range merge needed
+                    if range.is_overlap(&other.range) {
+                        other.try_compact_lock()?;
+                        high_lv.tables.push(other.clone());
+                        range.get_minimum_contain(&other.range);
+                    }
+                }
+            }
+        }
+
+        // Compact task must contain more than one sstable
+        if low_lv.tables.len() + high_lv.tables.len() <= 1 {
+            return Err(Error::Other);
         }
 
         Ok(CompactTask {
@@ -633,7 +675,12 @@ impl CompactTask {
     pub fn compact_size(&self) -> usize {
         debug_assert!(self.high_lv.lv > 0);
         // 10^L MB
-        (10_usize * 1024 * 1024).pow(self.high_lv.lv as u32)
+        (10_usize).pow(self.high_lv.lv as u32) * 1024 * 1024
+    }
+
+    #[inline]
+    pub fn target_lv(&self) -> usize {
+        self.high_lv.lv
     }
 
     // Add new compact result
@@ -714,7 +761,7 @@ mod tests {
     fn test_manifest() {
         {
             let (manifest, _) = Manifest::open("./data").unwrap();
-            let mut new_entry = manifest.alloc_new_sstable_entry();
+            let mut new_entry = manifest.alloc_new_sstable_entry(0);
             let mut entry_writer = new_entry.open_writer().unwrap();
             entry_writer.write_all(b"123123123123").unwrap();
             new_entry.set_range(SSTableRange {

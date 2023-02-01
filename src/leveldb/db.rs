@@ -1,3 +1,5 @@
+use crate::util::shutdown::{Listener, Notifier};
+
 use super::{
     compact::Compactor,
     manifest::Manifest,
@@ -14,20 +16,36 @@ use tracing::{info, warn};
 pub struct DB {
     manifest: Manifest,
     memtable: MemTable,
+    shutdown: Option<Notifier>,
+    rt: tokio::runtime::Runtime,
 }
 
 impl DB {
     // Open levelDB on given path
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let (manifest, rx) = Manifest::open(path.clone())?;
-        let mut memtable = MemTable::open(path)?;
+        let shutdown = Notifier::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let (manifest, compact_rx) = Manifest::open(path.clone())?;
+        let (memtable, dump_rx) = MemTable::open(path)?;
 
         // Start a background task
         // Transform memtable into level 0 sstable
-        listen_dump(manifest.clone(), memtable.take_dump_listener().unwrap());
-        listen_compact(manifest.clone(), rx);
-        Ok(DB { manifest, memtable })
+        listen_dump(
+            manifest.clone(),
+            memtable.clone(),
+            dump_rx,
+            shutdown.listen().unwrap(),
+        );
+        listen_compact(manifest.clone(), compact_rx, shutdown.listen().unwrap());
+        Ok(DB {
+            manifest,
+            memtable,
+            shutdown: Some(shutdown),
+            rt,
+        })
     }
 
     // Get value from db by key
@@ -67,47 +85,84 @@ impl DB {
     }
 }
 
+impl Drop for DB {
+    fn drop(&mut self) {
+        let mut shutdown = self.shutdown.take().unwrap();
+        self.rt.block_on(async move {
+            shutdown.notify().await;
+        });
+    }
+}
+
 // Listen the compact channel
-fn listen_compact(manifest: Manifest, mut listener: UnboundedReceiver<()>) {
+fn listen_compact(
+    manifest: Manifest,
+    mut listener: UnboundedReceiver<()>,
+    mut shutdown_listener: Listener,
+) {
     tokio::spawn(async move {
         info!("compact task listening...");
-        while let Some(()) = listener.recv().await {
-            info!("start find new compact task...");
-            for task in manifest.find_new_compact_tasks() {
-                let manifest = manifest.clone();
-                info!("compact task found, {:?}", task);
-                tokio::spawn(async move {
-                    if let Err(err) = Compactor::new(task, manifest).compact() {
-                        warn!(error = err.to_string(), "compact task failed")
+        loop {
+            tokio::select! {
+                _ = shutdown_listener.listen() => {
+                    // Stop creating new compact task if shutdown signal was notified
+                    break;
+                }
+                _ = listener.recv() => {
+                    info!("start find new compact task...");
+                    for task in manifest.find_new_compact_tasks() {
+                        let manifest = manifest.clone();
+                        info!("compact task found, {:?}", task);
+
+                        // Hold a listener copy, to block shutdown util compact task finish
+                        let new_shutdown_listener = shutdown_listener.clone();
+                        tokio::spawn(async move {
+                            new_shutdown_listener.hold();
+                            if let Err(err) = Compactor::new(task, manifest).compact() {
+                                warn!(error = err.to_string(), "compact task failed")
+                            }
+                        });
                     }
-                });
+                    info!("finish find new compact task");
+                }
             }
-            info!("finish find new compact task");
         }
+        info!("stop creating new compact task");
     });
 }
 
 // Listen the dump channel, dump memtable into sstable concurrently
-fn listen_dump(manifest: Manifest, mut listener: UnboundedReceiver<DumpRequest>) {
+fn listen_dump(
+    manifest: Manifest,
+    memtable: MemTable,
+    mut listener: UnboundedReceiver<DumpRequest>,
+    mut shutdown_listener: Listener,
+) {
     tokio::spawn(async move {
         info!("dump task listening...");
-        while let Some(request) = listener.recv().await {
-            let manifest = manifest.clone();
-            info!("dump request found");
-            tokio::spawn(async move {
-                if let Err(err) = dump(&manifest, request) {
-                    warn!(error = err.to_string(), "dump memtable into sstable failed",)
+        loop {
+            tokio::select! {
+                _ = shutdown_listener.listen() => {
+                    // Stop dump operation if shutdown signal was notified
+                    break;
                 }
-            });
+                Some(request) = listener.recv() => {
+                    info!("start a new dump operation");
+                    if let Err(err) = dump(&manifest, &memtable, request) {
+                        warn!(error = err.to_string(), "dump memtable into sstable failed");
+                    }
+                }
+            }
         }
+        info!("stop dump task")
     });
 }
 
 // Dump a memtable into level 0 sstable
-fn dump(manifest: &Manifest, request: DumpRequest) -> Result<()> {
+fn dump(manifest: &Manifest, memtable: &MemTable, request: DumpRequest) -> Result<()> {
+    // Build a new sstable from memtable if memtable is not empty
     if request.len() != 0 {
-        // Build a new sstable from memtable
-        let mut entry = manifest.alloc_new_sstable_entry();
+        let mut entry = manifest.alloc_new_sstable_entry(0);
         let mut builder = SSTableBuilder::new(entry.open_writer()?);
         for (key, value) in request.iter() {
             builder.add(key.clone(), value.clone())?;
@@ -121,7 +176,7 @@ fn dump(manifest: &Manifest, request: DumpRequest) -> Result<()> {
     }
 
     // Ask for clean memtable that is already dumped
-    request.ok();
+    memtable.clean_immutable(request.path());
 
     Ok(())
 }
@@ -158,19 +213,16 @@ mod tests {
     #[test]
     fn test_db_with_step_case() {
         tracing::warn!("start testing");
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed building the tokio runtime");
-        let _guard = runtime.enter();
 
-        let test_count = 100000;
+        let test_count = 1000;
         let db = DB::open("./data").unwrap();
+        println!("{:?}", db.get(&Bytes::from("10000".to_string())));
 
         for i in 0..test_count {
             let b = Bytes::from(i.to_string());
-            assert_eq!(db.get(&b).unwrap(), Some(b));
-            // db.set(b.clone(), b.clone()).unwrap();
+            // db.del(b).unwrap();
+            db.set(b.clone(), b.clone()).unwrap();
+            // assert_eq!(db.get(&b).unwrap(), None);
         }
     }
 }

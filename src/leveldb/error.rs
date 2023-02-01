@@ -35,4 +35,7 @@ pub enum Error {
 
     #[error("illegal manifest")]
     IllegalManifest,
+
+    #[error("other")]
+    Other,
 }
