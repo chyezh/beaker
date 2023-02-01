@@ -152,7 +152,7 @@ impl SSTableEntry {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 struct ManifestInner {
     version: u64,
     tables: Vec<Vec<Arc<SSTableEntry>>>,
@@ -399,8 +399,13 @@ impl Manifest {
         let mut manifest = RwLockUpgradableReadGuard::upgrade(manifest);
         *manifest = new_manifest;
 
-        // Trigger to find a compact task
-        self.compact_tx.send(()).unwrap();
+        // Trigger to find new compact task
+        if let Err(err) = self.compact_tx.send(()) {
+            info!(
+                error = err.to_string(),
+                "receiver for compact trigger has been released"
+            );
+        }
         Ok(())
     }
 
@@ -475,8 +480,11 @@ impl Manifest {
         }
 
         // Trigger to find new compact task
-        if let Err(e) = self.compact_tx.send(()) {
-            info!("receiver for compact trigger has been released");
+        if let Err(err) = self.compact_tx.send(()) {
+            info!(
+                error = err.to_string(),
+                "receiver for compact trigger has been released"
+            );
         }
         Ok(())
     }

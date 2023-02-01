@@ -47,9 +47,9 @@ impl SSTableRange {
     // Order with given key
     pub fn order(&self, key: &[u8]) -> std::cmp::Ordering {
         if key < self.left {
-            std::cmp::Ordering::Less
-        } else if key > self.right {
             std::cmp::Ordering::Greater
+        } else if key > self.right {
+            std::cmp::Ordering::Less
         } else {
             std::cmp::Ordering::Equal
         }
@@ -607,7 +607,7 @@ mod tests {
         builder.finish().unwrap();
 
         let v = Cursor::new(builder.writer);
-        let mut table = SSTable::open(v).unwrap();
+        let table = SSTable::open(v).unwrap();
 
         let result = table.search(b"123456789").unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"1234567689"));

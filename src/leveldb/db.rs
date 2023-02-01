@@ -186,6 +186,7 @@ mod tests {
 
     use super::*;
     use crate::util::generate_random_bytes;
+    use rand::{self, Rng};
     use test_log::test;
 
     #[test]
@@ -211,18 +212,83 @@ mod tests {
     }
 
     #[test]
-    fn test_db_with_step_case() {
+    fn test_get_db_with_sequence_number() {
+        let test_count = 1000000;
+        let db = DB::open("./data").unwrap();
+        // Get db
+        for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
+        {
+            assert_eq!(db.get(&k).unwrap(), Some(v.clone()));
+        }
+
+        // Reopen db and test get
+        drop(db);
+        let db = DB::open("./data").unwrap();
+        for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
+        {
+            assert_eq!(db.get(&k).unwrap(), Some(v.clone()));
+        }
+    }
+
+    #[test]
+    fn test_db_with_sequence_number() {
         tracing::warn!("start testing");
 
-        let test_count = 1000;
+        let mut rng = rand::thread_rng();
+        let test_count = 1000000;
         let db = DB::open("./data").unwrap();
-        println!("{:?}", db.get(&Bytes::from("10000".to_string())));
 
-        for i in 0..test_count {
-            let b = Bytes::from(i.to_string());
-            // db.del(b).unwrap();
-            db.set(b.clone(), b.clone()).unwrap();
-            // assert_eq!(db.get(&b).unwrap(), None);
+        // Set db
+        for i in sequence_number_iter(test_count) {
+            db.set(i.clone(), i.clone()).unwrap();
         }
+
+        // Get db
+        for i in sequence_number_iter(test_count) {
+            if 0 == rng.gen_range(0..100) {
+                assert_eq!(db.get(&i).unwrap(), Some(i.clone()));
+            }
+        }
+
+        // Reopen db and test get
+        drop(db);
+        let db = DB::open("./data").unwrap();
+        for i in sequence_number_iter(test_count) {
+            if 0 == rng.gen_range(0..100) {
+                assert_eq!(db.get(&i).unwrap(), Some(i.clone()));
+            }
+        }
+
+        // Set db
+        for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
+        {
+            db.set(k, v).unwrap();
+        }
+
+        // Get db
+        for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
+        {
+            if 0 == rng.gen_range(0..100) {
+                assert_eq!(db.get(&k).unwrap(), Some(v.clone()));
+            }
+        }
+
+        // Reopen db and test get
+        drop(db);
+        let db = DB::open("./data").unwrap();
+        for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
+        {
+            if 0 == rng.gen_range(0..100) {
+                assert_eq!(db.get(&k).unwrap(), Some(v.clone()));
+            }
+        }
+    }
+
+    fn sequence_number_iter(max: usize) -> impl Iterator<Item = Bytes> {
+        (0..max).map(|i| Bytes::from(i.to_string()))
+    }
+
+    fn reverse_sequence_number_iter(max: usize) -> impl Iterator<Item = Bytes> {
+        (0..max).map(|i| Bytes::from(i.to_string())).rev()
     }
 }
