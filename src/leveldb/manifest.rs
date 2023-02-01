@@ -667,15 +667,11 @@ impl CompactTask {
     }
 
     // Get new iterator iterating all tables waiting to compact
-    // Newest kv should be iterated first,
+    // older kv should be iterated first,
     // so high level should be iterated first,
-    // low level should be iterated in reverse order (level 0 may overlaps)
     #[inline]
     pub fn tables(&self) -> impl Iterator<Item = &Arc<SSTableEntry>> {
-        self.high_lv
-            .tables
-            .iter()
-            .chain(self.low_lv.tables.iter().rev())
+        self.high_lv.tables.iter().chain(self.low_lv.tables.iter())
     }
 
     // Get compact target level
