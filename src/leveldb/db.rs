@@ -10,14 +10,13 @@ use super::{
 };
 use bytes::Bytes;
 use std::path::PathBuf;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::{runtime::Handle, sync::mpsc::UnboundedReceiver};
 use tracing::{info, warn};
 
 pub struct DB {
     manifest: Manifest,
     memtable: MemTable,
     shutdown: Option<Notifier>,
-    rt: tokio::runtime::Runtime,
 }
 
 impl DB {
@@ -25,8 +24,6 @@ impl DB {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let shutdown = Notifier::new();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
 
         let (manifest, compact_rx) = Manifest::open(path.clone())?;
         let (memtable, dump_rx) = MemTable::open(path)?;
@@ -44,12 +41,11 @@ impl DB {
             manifest,
             memtable,
             shutdown: Some(shutdown),
-            rt,
         })
     }
 
     // Get value from db by key
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         // Get memtable first
         if let Some(value) = self.memtable.get(key) {
             match value {
@@ -61,8 +57,8 @@ impl DB {
         // Get possible sstables from manifest
         // Read sstable to search value
         for sstable in self.manifest.search(key) {
-            let sstable = SSTable::open(sstable.open_reader()?)?;
-            if let Some(value) = sstable.search(key)? {
+            let mut sstable = SSTable::open(sstable.open_reader().await?).await?;
+            if let Some(value) = sstable.search(key).await? {
                 match value {
                     Value::Living(v) => return Ok(Some(v)),
                     Value::Tombstone => return Ok(None),
@@ -83,14 +79,11 @@ impl DB {
     pub fn del(&self, key: Bytes) -> Result<()> {
         self.memtable.set(key, Value::Tombstone)
     }
-}
 
-impl Drop for DB {
-    fn drop(&mut self) {
+    // Shutdown the database, and drop the database
+    pub async fn shutdown(mut self) {
         let mut shutdown = self.shutdown.take().unwrap();
-        self.rt.block_on(async move {
-            shutdown.notify().await;
-        });
+        shutdown.notify().await;
     }
 }
 
@@ -118,7 +111,7 @@ fn listen_compact(
                         let new_shutdown_listener = shutdown_listener.clone();
                         tokio::spawn(async move {
                             new_shutdown_listener.hold();
-                            if let Err(err) = Compactor::new(task, manifest).compact() {
+                            if let Err(err) = Compactor::new(task, manifest).compact().await {
                                 warn!(error = err.to_string(), "compact task failed")
                             }
                         });
@@ -148,7 +141,7 @@ fn listen_dump(
                 }
                 Some(request) = listener.recv() => {
                     info!("start a new dump operation");
-                    if let Err(err) = dump(&manifest, &memtable, request) {
+                    if let Err(err) = dump(&manifest, &memtable, request).await {
                         warn!(error = err.to_string(), "dump memtable into sstable failed");
                     }
                 }
@@ -159,16 +152,16 @@ fn listen_dump(
 }
 
 // Dump a memtable into level 0 sstable
-fn dump(manifest: &Manifest, memtable: &MemTable, request: DumpRequest) -> Result<()> {
+async fn dump(manifest: &Manifest, memtable: &MemTable, request: DumpRequest) -> Result<()> {
     // Build a new sstable from memtable if memtable is not empty
     if request.len() != 0 {
         let mut entry = manifest.alloc_new_sstable_entry(0);
-        let mut builder = SSTableBuilder::new(entry.open_writer()?);
+        let mut builder = SSTableBuilder::new(entry.open_writer().await?);
         for (key, value) in request.iter() {
-            builder.add(key.clone(), value.clone())?;
+            builder.add(key.clone(), value.clone()).await?;
         }
 
-        let range = builder.finish()?;
+        let range = builder.finish().await?;
         entry.set_range(range);
 
         // Register the new sstable into manifest
@@ -187,15 +180,11 @@ mod tests {
     use super::*;
     use crate::util::generate_random_bytes;
     use rand::{self, Rng};
-    use test_log::test;
+    use tokio::test;
 
     #[test]
-    fn test_db_with_random_case() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed building the tokio runtime");
-        let _guard = runtime.enter();
+    async fn test_db_with_random_case() {
+        let _ = env_logger::builder().is_test(true).try_init();
 
         let test_count = 1000;
         let test_case_key = generate_random_bytes(test_count, 10000);
@@ -207,32 +196,36 @@ mod tests {
         }
 
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            assert_eq!(db.get(key).unwrap().unwrap(), value.clone());
+            assert_eq!(db.get(key).await.unwrap().unwrap(), value.clone());
         }
+        db.shutdown().await;
     }
 
     #[test]
-    fn test_get_db_with_sequence_number() {
+    async fn test_get_db_with_sequence_number() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
         let test_count = 1000000;
         let db = DB::open("./data").unwrap();
         // Get db
         for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
         {
-            assert_eq!(db.get(&k).unwrap(), Some(v.clone()));
+            assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
         }
 
         // Reopen db and test get
-        drop(db);
+        db.shutdown().await;
         let db = DB::open("./data").unwrap();
         for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
         {
-            assert_eq!(db.get(&k).unwrap(), Some(v.clone()));
+            assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
         }
     }
 
-    #[test]
-    fn test_db_with_sequence_number() {
-        tracing::warn!("start testing");
+    #[test(flavor = "multi_thread", worker_threads = 3)]
+    async fn test_db_with_sequence_number() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        tracing::info!("start testing");
 
         let mut rng = rand::thread_rng();
         let test_count = 1000000;
@@ -246,16 +239,16 @@ mod tests {
         // Get db
         for i in sequence_number_iter(test_count) {
             if 0 == rng.gen_range(0..100) {
-                assert_eq!(db.get(&i).unwrap(), Some(i.clone()));
+                assert_eq!(db.get(&i).await.unwrap(), Some(i.clone()));
             }
         }
+        db.shutdown().await;
 
         // Reopen db and test get
-        drop(db);
         let db = DB::open("./data").unwrap();
         for i in sequence_number_iter(test_count) {
             if 0 == rng.gen_range(0..100) {
-                assert_eq!(db.get(&i).unwrap(), Some(i.clone()));
+                assert_eq!(db.get(&i).await.unwrap(), Some(i.clone()));
             }
         }
 
@@ -269,17 +262,17 @@ mod tests {
         for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
         {
             if 0 == rng.gen_range(0..100) {
-                assert_eq!(db.get(&k).unwrap(), Some(v.clone()));
+                assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
             }
         }
 
         // Reopen db and test get
-        drop(db);
+        db.shutdown().await;
         let db = DB::open("./data").unwrap();
         for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
         {
             if 0 == rng.gen_range(0..100) {
-                assert_eq!(db.get(&k).unwrap(), Some(v.clone()));
+                assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
             }
         }
     }

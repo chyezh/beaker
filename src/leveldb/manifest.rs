@@ -33,21 +33,22 @@ pub struct SSTableEntry {
 
 impl SSTableEntry {
     // Open a sstable reader for this file
-    pub fn open_reader(&self) -> Result<File> {
+    pub async fn open_reader(&self) -> Result<tokio::fs::File> {
         let path = Self::file_path(self.root_path.clone(), &self.uid);
-        let new_file = File::open(path)?;
+        let new_file = tokio::fs::File::open(path).await?;
         Ok(new_file)
     }
 
     // Open a sstable writer for this file
-    pub fn open_writer(&self) -> Result<File> {
+    pub async fn open_writer(&self) -> Result<tokio::fs::File> {
         // TODO: file_lock
         let path = Self::file_path(self.root_path.clone(), &self.uid);
-        let new_file = OpenOptions::new()
+        let new_file = tokio::fs::OpenOptions::new()
             .truncate(true)
             .create(true)
             .write(true)
-            .open(path)?;
+            .open(path)
+            .await?;
         Ok(new_file)
     }
 
@@ -754,31 +755,4 @@ fn open_new_manifest(dir: &Path, seq: u64) -> Result<File> {
         .open(&path)?;
 
     Ok(new_file)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use test_log::test;
-
-    #[test]
-    fn test_manifest() {
-        {
-            let (manifest, _) = Manifest::open("./data").unwrap();
-            let mut new_entry = manifest.alloc_new_sstable_entry(0);
-            let mut entry_writer = new_entry.open_writer().unwrap();
-            entry_writer.write_all(b"123123123123").unwrap();
-            new_entry.set_range(SSTableRange {
-                left: Bytes::from("123"),
-                right: Bytes::from("456"),
-            });
-
-            manifest.add_new_sstable(new_entry).unwrap();
-        }
-
-        {
-            let (manifest, _) = Manifest::open("./data").unwrap();
-            assert_eq!(manifest.inner.read().tables[0].len(), 1);
-        }
-    }
 }

@@ -1,10 +1,10 @@
 use super::manifest::{CompactTask, Manifest, SSTableEntry};
-use super::sstable::{SSTable, SSTableBuilder, SSTableIntoIterator};
+use super::sstable::{SSTable, SSTableBuilder, SSTableStream};
 use super::util::Value;
 use super::Result;
 use bytes::Bytes;
-use std::fs::File;
-use std::io::{Read, Seek};
+use tokio::fs::File;
+use tokio::io::{AsyncRead, AsyncSeek};
 
 pub struct Compactor {
     task: CompactTask,
@@ -17,17 +17,18 @@ impl Compactor {
     }
 
     // Do the compact operation
-    pub fn compact(mut self) -> Result<()> {
+    pub async fn compact(mut self) -> Result<()> {
         let compact_size = self.task.compact_size();
         let erase_tombstone = self.task.need_erase_tombstone();
         let target_lv = self.task.target_lv();
         let mut new_entry: Option<(SSTableEntry, SSTableBuilder<File>)> = None;
+        let mut sstable_iter = self.open_all_sstable().await?;
 
-        for element in self.open_all_sstable()? {
+        while let Some(element) = sstable_iter.next().await {
             if new_entry.is_none() {
                 // Start a new builder
                 let entry = self.manifest.alloc_new_sstable_entry(target_lv);
-                let builder = SSTableBuilder::new(entry.open_writer()?);
+                let builder = SSTableBuilder::new(entry.open_writer().await?);
                 new_entry = Some((entry, builder));
             }
 
@@ -38,10 +39,10 @@ impl Compactor {
                 continue;
             }
 
-            let size = new_entry.as_mut().unwrap().1.add(key, value)?;
+            let size = new_entry.as_mut().unwrap().1.add(key, value).await?;
             if size >= compact_size {
                 // Finish one compaction
-                let range = new_entry.as_mut().unwrap().1.finish()?;
+                let range = new_entry.as_mut().unwrap().1.finish().await?;
                 new_entry.as_mut().unwrap().0.set_range(range);
                 self.task.add_compact_result(new_entry.take().unwrap().0);
             }
@@ -49,7 +50,7 @@ impl Compactor {
 
         // Finish remaining compaction
         if let Some(mut entry) = new_entry {
-            entry.0.set_range(entry.1.finish()?);
+            entry.0.set_range(entry.1.finish().await?);
             self.task.add_compact_result(entry.0);
         }
 
@@ -58,10 +59,13 @@ impl Compactor {
     }
 
     // Open all sstable for compact operation
-    fn open_all_sstable(&self) -> Result<SSTablesIter<File>> {
+    async fn open_all_sstable(&self) -> Result<SSTablesIter<tokio::fs::File>> {
         let mut sstables = Vec::with_capacity(self.task.tables().size_hint().0);
         for table in self.task.tables() {
-            sstables.push(SSTable::open(table.open_reader()?)?.into_iter());
+            let s = SSTable::open(table.open_reader().await?)
+                .await?
+                .into_stream();
+            sstables.push(s);
         }
         let table_count = sstables.len();
 
@@ -73,18 +77,18 @@ impl Compactor {
 }
 
 // SSTables iteration util struct, iterating sstables by merge-sort algorithm
-struct SSTablesIter<R: Seek + Read> {
-    iters: Vec<SSTableIntoIterator<R>>,
+struct SSTablesIter<R> {
+    iters: Vec<SSTableStream<R>>,
     kvs: Vec<Option<(Bytes, Value)>>,
 }
 
-impl<R: Seek + Read> SSTablesIter<R> {
+impl<R: AsyncRead + AsyncSeek + Unpin> SSTablesIter<R> {
     // Fill the none element in kvs array with respective iterator
-    fn fill_kvs(&mut self) -> Result<()> {
+    async fn fill_kvs(&mut self) -> Result<()> {
         debug_assert_eq!(self.iters.len(), self.kvs.len());
         for (idx, last) in self.kvs.iter_mut().enumerate() {
             if last.is_none() {
-                match self.iters[idx].next() {
+                match self.iters[idx].next().await {
                     Some(Ok(item)) => *last = Some(item),
                     Some(Err(e)) => return Err(e),
                     None => {}
@@ -96,7 +100,7 @@ impl<R: Seek + Read> SSTablesIter<R> {
     }
 
     // Select minimal key in kvs array, and take it
-    fn take_min_kv(&mut self) -> Option<(Bytes, Value)> {
+    async fn take_min_kv(&mut self) -> Option<(Bytes, Value)> {
         debug_assert!(self.iters.len() > 1);
 
         let mut need_take_idx = Vec::with_capacity(self.iters.len());
@@ -132,17 +136,11 @@ impl<R: Seek + Read> SSTablesIter<R> {
         // Return kv with minimal key in the newest layer
         self.kvs[min_idx].take()
     }
-}
 
-impl<R: Seek + Read> Iterator for SSTablesIter<R> {
-    type Item = Result<(Bytes, Value)>;
-
-    // Iterating iters, give minimal and newest key
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Err(e) = self.fill_kvs() {
+    pub async fn next(&mut self) -> Option<Result<(Bytes, Value)>> {
+        if let Err(e) = self.fill_kvs().await {
             return Some(Err(e));
         }
-
-        self.take_min_kv().map(Ok)
+        self.take_min_kv().await.map(Ok)
     }
 }

@@ -1,16 +1,12 @@
-use bytes::Bytes;
-
-use crate::util::{checksum, from_le_bytes_32, from_le_bytes_64, seek_and_read_buf};
-
 use super::{
     block::{Block, BlockBuilder, BlockIntoIterator},
     util::Value,
     Error, Result,
 };
-use std::{
-    io::{Read, Seek, SeekFrom, Write},
-    sync::{Arc, Mutex},
-};
+use crate::util::{async_util::seek_and_read_buf, checksum, from_le_bytes_32, from_le_bytes_64};
+use bytes::Bytes;
+use std::io::SeekFrom;
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt};
 
 const FOOTER_SIZE: usize = 12; // 12bytes
 const BLOCK_DEFAULT_SIZE: usize = 4 * 1024; // 4kb
@@ -56,20 +52,21 @@ impl SSTableRange {
     }
 }
 
-pub struct SSTable<R: Seek + Read> {
+pub struct SSTable<R> {
     index: Index,
-    reader: Arc<Mutex<Option<R>>>,
+    reader: R,
     range: SSTableRange, // Key range of this table [xxx, xxx]
 }
 
-impl<R: Seek + Read> SSTable<R> {
-    pub fn open(mut reader: R) -> Result<Self> {
+impl<R: AsyncSeek + AsyncRead + Unpin> SSTable<R> {
+    pub async fn open(mut reader: R) -> Result<Self> {
         // Recover footer from file
         let footer_buffer = seek_and_read_buf(
             &mut reader,
             SeekFrom::End(-(FOOTER_SIZE as i64)),
             FOOTER_SIZE,
-        )?;
+        )
+        .await?;
         let footer = Footer::from_bytes(&footer_buffer)?;
 
         // Read index
@@ -77,7 +74,8 @@ impl<R: Seek + Read> SSTable<R> {
             &mut reader,
             SeekFrom::Start(footer.index_offset),
             footer.index_size,
-        )?;
+        )
+        .await?;
         debug_assert_eq!(index_buffer.len(), footer.index_size);
         if index_buffer.len() != footer.index_size {
             return Err(Error::BadSSTable);
@@ -105,7 +103,8 @@ impl<R: Seek + Read> SSTable<R> {
             &mut reader,
             SeekFrom::Start(first_block.offset),
             first_block.size,
-        )?;
+        )
+        .await?;
         debug_assert_eq!(block_buffer.len(), first_block.size);
         if block_buffer.len() != first_block.size {
             return Err(Error::BadSSTable);
@@ -123,7 +122,8 @@ impl<R: Seek + Read> SSTable<R> {
                 &mut reader,
                 SeekFrom::Start(last_block.offset),
                 last_block.size,
-            )?;
+            )
+            .await?;
             debug_assert_eq!(block_buffer.len(), last_block.size);
             if block_buffer.len() != last_block.size {
                 return Err(Error::BadSSTable);
@@ -138,7 +138,7 @@ impl<R: Seek + Read> SSTable<R> {
 
         Ok(SSTable {
             index,
-            reader: Arc::new(Mutex::new(Some(reader))),
+            reader,
             range: SSTableRange {
                 left: first_key,
                 right: last_key,
@@ -146,8 +146,7 @@ impl<R: Seek + Read> SSTable<R> {
         })
     }
 
-    pub fn search(&self, key: &[u8]) -> Result<Option<Value>> {
-        debug_assert!(self.reader.lock().unwrap().is_some());
+    pub async fn search(&mut self, key: &[u8]) -> Result<Option<Value>> {
         if !self.range.in_range(key) {
             return Ok(None);
         }
@@ -161,10 +160,11 @@ impl<R: Seek + Read> SSTable<R> {
 
         let block_info = &self.index.index[search_index];
         let block_buffer = seek_and_read_buf(
-            (*self.reader.lock().unwrap()).as_mut().unwrap(),
+            &mut self.reader,
             SeekFrom::Start(block_info.offset),
             block_info.size,
-        )?;
+        )
+        .await?;
         debug_assert_eq!(block_buffer.len(), block_info.size);
         if block_buffer.len() != block_info.size {
             return Err(Error::BadSSTable);
@@ -175,25 +175,18 @@ impl<R: Seek + Read> SSTable<R> {
         }
         Ok(None)
     }
-}
 
-impl<R: Read + Seek> IntoIterator for SSTable<R> {
-    type Item = Result<(Bytes, Value)>;
-    type IntoIter = SSTableIntoIterator<R>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        // Reader is always exists
-        debug_assert!(self.reader.lock().unwrap().is_some());
-        SSTableIntoIterator {
+    pub fn into_stream(self) -> SSTableStream<R> {
+        SSTableStream {
             block: None,
             index: self.index.index.into_iter(),
-            reader: (*self.reader.lock().unwrap()).take().unwrap(),
+            reader: self.reader,
             stop: false,
         }
     }
 }
 
-pub struct SSTableIntoIterator<R: Seek + Read> {
+pub struct SSTableStream<R> {
     block: Option<BlockIntoIterator>,
     index: std::vec::IntoIter<BlockItem>,
     reader: R,
@@ -201,10 +194,8 @@ pub struct SSTableIntoIterator<R: Seek + Read> {
 }
 
 // Implement a Iterator to iterating the sstable
-impl<R: Seek + Read> Iterator for SSTableIntoIterator<R> {
-    type Item = Result<(Bytes, Value)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl<R: AsyncSeek + AsyncRead + Unpin> SSTableStream<R> {
+    pub async fn next(&mut self) -> Option<Result<(Bytes, Value)>> {
         if self.stop {
             return None;
         }
@@ -247,7 +238,8 @@ impl<R: Seek + Read> Iterator for SSTableIntoIterator<R> {
                             &mut self.reader,
                             SeekFrom::Start(block_item.offset),
                             block_item.size,
-                        );
+                        )
+                        .await;
                         if let Err(e) = block_buffer {
                             // Unexpected error occurred
                             // Stop iteration
@@ -356,7 +348,7 @@ impl Index {
 }
 
 // Build a single sstable, use leveldb definition without filter block.
-pub struct SSTableBuilder<W: Write> {
+pub struct SSTableBuilder<W> {
     writer: W,
     data_block: BlockBuilder,
     index_block: BlockBuilder,
@@ -366,7 +358,7 @@ pub struct SSTableBuilder<W: Write> {
     range: (Option<Bytes>, Option<Bytes>),
 }
 
-impl<W: Write> SSTableBuilder<W> {
+impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
     pub fn new(writer: W) -> Self {
         SSTableBuilder {
             writer,
@@ -380,7 +372,7 @@ impl<W: Write> SSTableBuilder<W> {
     }
 
     // Add a new key to sstable and return size estimate
-    pub fn add(&mut self, key: Bytes, value: Value) -> Result<usize> {
+    pub async fn add(&mut self, key: Bytes, value: Value) -> Result<usize> {
         self.data_block.add(&key, &value.to_bytes());
         self.last_key.clear();
         self.last_key.extend_from_slice(&key);
@@ -391,7 +383,7 @@ impl<W: Write> SSTableBuilder<W> {
         // Flush if block size is bigger enough, add a index
         if block_size > BLOCK_DEFAULT_SIZE {
             self.complete_data_block_size += block_size;
-            let (offset, data_size) = self.flush_new_data_block()?;
+            let (offset, data_size) = self.flush_new_data_block().await?;
             self.add_new_index(offset, data_size);
         }
 
@@ -406,13 +398,13 @@ impl<W: Write> SSTableBuilder<W> {
     }
 
     // Finish a table construction, and get the sstable range
-    pub fn finish(&mut self) -> Result<SSTableRange> {
+    pub async fn finish(&mut self) -> Result<SSTableRange> {
         debug_assert!(self.range.0.is_some());
         debug_assert!(self.range.1.is_some());
 
         // Append new data block if data_block is not empty
         if !self.data_block.is_empty() {
-            let (offset, data_size) = self.flush_new_data_block()?;
+            let (offset, data_size) = self.flush_new_data_block().await?;
             self.add_new_index(offset, data_size)
         }
 
@@ -421,15 +413,18 @@ impl<W: Write> SSTableBuilder<W> {
         let index_offset = self.offset;
         let index_size = data.len() + 4; // add checksum extra
 
-        self.writer.write_all(data)?;
-        self.writer.write_all(&checksum(data).to_le_bytes()[0..4])?;
+        self.writer.write_all(data).await?;
+        self.writer
+            .write_all(&checksum(data).to_le_bytes()[0..4])
+            .await?;
 
         self.index_block.reset();
         self.offset += index_size as u64 + 4;
 
         // Append footer
         self.writer
-            .write_all(&Footer::new(index_offset, index_size).to_bytes())?;
+            .write_all(&Footer::new(index_offset, index_size).to_bytes())
+            .await?;
 
         Ok(SSTableRange {
             left: self.range.0.as_ref().unwrap().clone(),
@@ -452,14 +447,16 @@ impl<W: Write> SSTableBuilder<W> {
         self.index_block.add(&self.last_key, &new_index_value);
     }
 
-    fn flush_new_data_block(&mut self) -> Result<(u64, usize)> {
+    pub async fn flush_new_data_block(&mut self) -> Result<(u64, usize)> {
         let data = self.data_block.finish();
         let data_size = data.len();
         let offset = self.offset;
 
         // Write data and checksum, clear data block builder
-        self.writer.write_all(data)?;
-        self.writer.write_all(&checksum(data).to_le_bytes()[0..4])?;
+        self.writer.write_all(data).await?;
+        self.writer
+            .write_all(&checksum(data).to_le_bytes()[0..4])
+            .await?;
         self.data_block.reset();
 
         self.offset += data_size as u64 + 4; // advance offset(data_size + checksum_size)
@@ -475,34 +472,36 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::io::Cursor;
+    use tokio::test;
 
     #[test]
-    fn test_table_build_and_search_with_random_case() {
-        let (test_case_key, test_case_value, mut table) = create_new_table_with_random_case(1000);
+    async fn test_table_build_and_search_with_random_case() {
+        let (test_case_key, test_case_value, mut table) =
+            create_new_table_with_random_case(1000).await;
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             assert_eq!(
-                table.search(key).unwrap().unwrap(),
+                table.search(key).await.unwrap().unwrap(),
                 Value::living(value.clone())
             );
         }
     }
 
     #[test]
-    fn test_compact_table_with_random_case() {
+    async fn test_compact_table_with_random_case() {
         let (test_case_key_1, test_case_value_1, mut table_1) =
-            create_new_table_with_random_case(1500);
+            create_new_table_with_random_case(1500).await;
         for (key, value) in test_case_key_1.iter().zip(test_case_value_1.iter()) {
             assert_eq!(
-                table_1.search(key).unwrap().unwrap(),
+                table_1.search(key).await.unwrap().unwrap(),
                 Value::living(value.clone())
             );
         }
 
         let (test_case_key_2, test_case_value_2, mut table_2) =
-            create_new_table_with_random_case(1000);
+            create_new_table_with_random_case(1000).await;
         for (key, value) in test_case_key_2.iter().zip(test_case_value_2.iter()) {
             assert_eq!(
-                table_2.search(key).unwrap().unwrap(),
+                table_2.search(key).await.unwrap().unwrap(),
                 Value::living(value.clone())
             );
         }
@@ -541,7 +540,7 @@ mod tests {
         // }
     }
 
-    fn create_new_table_with_random_case(
+    async fn create_new_table_with_random_case(
         test_count: usize,
     ) -> (Vec<Bytes>, Vec<Bytes>, SSTable<Cursor<Bytes>>) {
         // Generate random test case
@@ -554,19 +553,20 @@ mod tests {
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             builder
                 .add(key.clone(), Value::living(value.clone()))
+                .await
                 .unwrap();
         }
-        builder.finish().unwrap();
+        builder.finish().await.unwrap();
 
         // test search operation
         let buffer = Cursor::new(Bytes::from(builder.writer));
-        let table = SSTable::open(buffer).unwrap();
+        let table = SSTable::open(buffer).await.unwrap();
 
         (test_case_key, test_case_value, table)
     }
 
     #[test]
-    fn test_table_build_and_search() {
+    async fn test_table_build_and_search() {
         use std::io::Cursor;
 
         let v = Vec::new();
@@ -576,56 +576,63 @@ mod tests {
                 Bytes::from_static(b"123456789"),
                 Value::living_static(b"1234567689"),
             )
+            .await
             .unwrap();
         builder
             .add(
                 Bytes::from_static(b"1234567891"),
                 Value::living_static(b"1234567689"),
             )
+            .await
             .unwrap();
         builder
             .add(
                 Bytes::from_static(b"12345678912"),
                 Value::living_static(b"1234567689"),
             )
+            .await
             .unwrap();
         builder
             .add(
                 Bytes::from_static(b"12345678923"),
                 Value::living_static(b"1234567689"),
             )
+            .await
             .unwrap();
         builder
             .add(Bytes::from_static(b"2"), Value::living_static(b"2"))
+            .await
             .unwrap();
         builder
             .add(Bytes::from_static(b"3"), Value::living_static(b"3"))
+            .await
             .unwrap();
         builder
             .add(Bytes::from_static(b"4"), Value::living_static(b""))
+            .await
             .unwrap();
-        builder.finish().unwrap();
+        builder.finish().await.unwrap();
 
         let v = Cursor::new(builder.writer);
-        let table = SSTable::open(v).unwrap();
+        let mut table = SSTable::open(v).await.unwrap();
 
-        let result = table.search(b"123456789").unwrap().unwrap();
+        let result = table.search(b"123456789").await.unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search(b"1234567891").unwrap().unwrap();
+        let result = table.search(b"1234567891").await.unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search(b"12345678912").unwrap().unwrap();
+        let result = table.search(b"12345678912").await.unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search(b"12345678923").unwrap().unwrap();
+        let result = table.search(b"12345678923").await.unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search(b"2").unwrap().unwrap();
+        let result = table.search(b"2").await.unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"2"));
-        let result = table.search(b"3").unwrap().unwrap();
+        let result = table.search(b"3").await.unwrap().unwrap();
         assert_eq!(result, Value::living_static(b"3"));
-        let result = table.search(b"4").unwrap().unwrap();
+        let result = table.search(b"4").await.unwrap().unwrap();
         assert_eq!(result, Value::living_static(b""));
-        assert!(table.search(b"1000").unwrap().is_none());
-        assert!(table.search(b"1").unwrap().is_none());
-        assert!(table.search(b"666").unwrap().is_none());
-        assert!(table.search(b"5").unwrap().is_none());
+        assert!(table.search(b"1000").await.unwrap().is_none());
+        assert!(table.search(b"1").await.unwrap().is_none());
+        assert!(table.search(b"666").await.unwrap().is_none());
+        assert!(table.search(b"5").await.unwrap().is_none());
     }
 }
