@@ -189,7 +189,7 @@ fn listen_clear_inactive_readers(mut shutdown_listener: Listener) {
                 }
                 _ = interval.tick() => {
                     info!("start clear inactive readers");
-                    sstable::clear_inactive_readers();
+                    sstable::clear_inactive_readers(60);
                 }
             }
         }
@@ -247,10 +247,10 @@ async fn dump(manifest: &Manifest, memtable: &MemTable, request: DumpRequest) ->
 #[cfg(test)]
 mod tests {
 
-    use std::arch::x86_64::_mm256_shuffle_epi8;
-
     use super::*;
-    use crate::util::generate_random_bytes;
+    use crate::util::test_case::{
+        generate_random_bytes, reverse_sequence_number_iter, sequence_number_iter,
+    };
     use rand::{self, Rng};
     use tokio::test;
 
@@ -360,13 +360,5 @@ mod tests {
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-    }
-
-    fn sequence_number_iter(max: usize) -> impl Iterator<Item = Bytes> {
-        (0..max).map(|i| Bytes::from(i.to_string()))
-    }
-
-    fn reverse_sequence_number_iter(max: usize) -> impl Iterator<Item = Bytes> {
-        (0..max).map(|i| Bytes::from(i.to_string())).rev()
     }
 }

@@ -291,7 +291,7 @@ impl<W: Write> RecordWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::generate_random_bytes;
+    use crate::util::test_case::generate_random_bytes;
 
     #[test]
     fn test_read_writer_with_random_case() {

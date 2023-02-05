@@ -68,40 +68,50 @@ pub fn from_le_bytes_32(data: &[u8]) -> usize {
 }
 
 #[cfg(test)]
-pub fn generate_random_bytes_vec(num: usize, max_len: usize) -> Vec<Vec<u8>> {
-    use rand::{Rng, RngCore};
-
-    let mut v = Vec::with_capacity(num);
-    for _ in 0..num {
-        let mut rng = rand::thread_rng();
-        let size: usize = rng.gen_range(1..max_len);
-        let mut new_bytes = vec![0; size];
-        rng.fill_bytes(&mut new_bytes[..]);
-        v.push(new_bytes);
-    }
-    v
-}
-
 #[cfg(test)]
-pub fn generate_random_bytes(num: usize, max_len: usize) -> Vec<Bytes> {
-    use rand::{Rng, RngCore};
+pub mod test_case {
+    use bytes::Bytes;
 
-    let mut v = Vec::with_capacity(num);
-    for _ in 0..num {
-        let mut rng = rand::thread_rng();
-        let size: usize = rng.gen_range(1..max_len);
-        let mut new_bytes = vec![0; size];
-        rng.fill_bytes(&mut new_bytes[..]);
-        v.push(Bytes::from(new_bytes));
+    pub fn generate_step_by_bytes(num: usize) -> Vec<Bytes> {
+        let mut v = Vec::with_capacity(num);
+        for i in 0..num {
+            v.push(Bytes::from(i.to_string()));
+        }
+        v
     }
-    v
-}
+    pub fn sequence_number_iter(max: usize) -> impl Iterator<Item = Bytes> {
+        (0..max).map(|i| Bytes::from(i.to_string()))
+    }
 
-#[cfg(test)]
-pub fn generate_step_by_bytes(num: usize) -> Vec<Bytes> {
-    let mut v = Vec::with_capacity(num);
-    for i in 0..num {
-        v.push(Bytes::from(i.to_string()));
+    pub fn reverse_sequence_number_iter(max: usize) -> impl Iterator<Item = Bytes> {
+        (0..max).map(|i| Bytes::from(i.to_string())).rev()
     }
-    v
+
+    pub fn generate_random_bytes_vec(num: usize, max_len: usize) -> Vec<Vec<u8>> {
+        use rand::{Rng, RngCore};
+
+        let mut v = Vec::with_capacity(num);
+        for _ in 0..num {
+            let mut rng = rand::thread_rng();
+            let size: usize = rng.gen_range(1..max_len);
+            let mut new_bytes = vec![0; size];
+            rng.fill_bytes(&mut new_bytes[..]);
+            v.push(new_bytes);
+        }
+        v
+    }
+
+    pub fn generate_random_bytes(num: usize, max_len: usize) -> Vec<Bytes> {
+        use rand::{Rng, RngCore};
+
+        let mut v = Vec::with_capacity(num);
+        for _ in 0..num {
+            let mut rng = rand::thread_rng();
+            let size: usize = rng.gen_range(1..max_len);
+            let mut new_bytes = vec![0; size];
+            rng.fill_bytes(&mut new_bytes[..]);
+            v.push(Bytes::from(new_bytes));
+        }
+        v
+    }
 }

@@ -287,7 +287,7 @@ mod tests {
     use core::panic;
 
     use super::*;
-    use crate::util::generate_random_bytes;
+    use crate::util::test_case::generate_random_bytes;
 
     #[test]
     fn test_log_with_random_case() {

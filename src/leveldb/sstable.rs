@@ -41,8 +41,8 @@ pub async fn open(entry: Arc<SSTableEntry>) -> Result<Arc<SSTable<File>>> {
     MANAGER.open(entry).await
 }
 
-pub fn clear_inactive_readers() {
-    MANAGER.clear_inactive_readers();
+pub fn clear_inactive_readers(secs: u64) {
+    MANAGER.clear_inactive_readers(secs);
 }
 
 pub fn is_active_uuid(uid: &Uuid) -> bool {
@@ -256,6 +256,7 @@ impl SSTableEntry {
 
 impl Drop for SSTableEntry {
     fn drop(&mut self) {
+        println!("drop entry");
         MANAGER.drop_entry(&self.uid);
     }
 }
@@ -343,7 +344,7 @@ impl SSTable<File> {
             index_offset: 0,
             reader,
             stop: false,
-            entry: Arc::clone(&self.entry),
+            _entry: Arc::clone(&self.entry),
         })
     }
 }
@@ -397,9 +398,9 @@ impl<R: AsyncRead + AsyncSeek + Unpin> SSTable<R> {
 
     // SSTable is active if someone access it one minute ago
     #[inline]
-    fn is_active(&self) -> bool {
+    fn is_active(&self, secs: u64) -> bool {
         let last_access = self.last_access.load(Ordering::Acquire);
-        (Instant::now().duration_since(self.create_time).as_secs() - last_access) < 60
+        (Instant::now().duration_since(self.create_time).as_secs() - last_access) < secs
     }
 }
 
@@ -410,7 +411,7 @@ pub struct SSTableStream<R: AsyncRead + AsyncSeek + Unpin> {
     index_offset: usize,
     reader: R,
     stop: bool,
-    entry: Arc<SSTableEntry>,
+    _entry: Arc<SSTableEntry>,
 }
 
 // Implement a Iterator to iterating the sstable
@@ -602,13 +603,13 @@ impl SSTableManager<File> {
     }
 
     // Clear all inactive readers
-    pub fn clear_inactive_readers(&self) {
+    pub fn clear_inactive_readers(&self, secs: u64) {
         // Pre-find all inactive reader, avoid acquire write lock
         let mut uid_list = Vec::new();
         {
             let reader = self.readers.read();
             for (uid, sstable) in reader.iter() {
-                if !sstable.is_active() {
+                if !sstable.is_active(secs) {
                     uid_list.push(*uid);
                 }
             }
@@ -732,21 +733,7 @@ impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
         Ok(self.entry)
     }
 
-    #[inline]
-    pub fn size_estimate(&self) -> usize {
-        self.complete_data_block_size
-            + self.data_block.size_estimate()
-            + self.index_block.size_estimate()
-    }
-
-    fn add_new_index(&mut self, offset: u64, data_size: usize) {
-        let mut new_index_value: [u8; 12] = [0; 12];
-        new_index_value[0..8].copy_from_slice(&offset.to_le_bytes()[0..8]);
-        new_index_value[8..12].copy_from_slice(&data_size.to_le_bytes()[0..4]);
-
-        self.index_block.add(&self.last_key, &new_index_value);
-    }
-
+    // flush a new data block into underlying writer
     pub async fn flush_new_data_block(&mut self) -> Result<(u64, usize)> {
         let data = self.data_block.finish();
         let data_size = data.len();
@@ -761,5 +748,76 @@ impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
         self.offset += data_size as u64 + 4; // advance offset(data_size + checksum_size)
 
         Ok((offset, data_size))
+    }
+
+    // Add new index into builder
+    fn add_new_index(&mut self, offset: u64, data_size: usize) {
+        let mut new_index_value: [u8; 12] = [0; 12];
+        new_index_value[0..8].copy_from_slice(&offset.to_le_bytes()[0..8]);
+        new_index_value[8..12].copy_from_slice(&data_size.to_le_bytes()[0..4]);
+
+        self.index_block.add(&self.last_key, &new_index_value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::test_case::generate_random_bytes;
+    use tokio::test;
+
+    #[test]
+    async fn test_sstable_builder_and_stream() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let test_count = 10000;
+        let mut test_case_key = generate_random_bytes(test_count, 1000);
+        let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
+        test_case_key.sort();
+        std::fs::create_dir_all("./data").unwrap();
+
+        let mut uid: Option<Uuid> = None;
+        {
+            let entry = SSTableEntry::new(0, "./data".into());
+            uid = Some(entry.uid);
+            // Check MANAGER
+            assert!(is_active_uuid(&uid.unwrap()));
+            // Test build
+            let mut builder = entry.open_builder().await.unwrap();
+            for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
+                builder
+                    .add(key.clone(), Value::Living(value.clone()))
+                    .await
+                    .unwrap();
+            }
+            let entry = Arc::new(builder.finish().await.unwrap());
+
+            // Open sstable
+            let sstable = open(entry).await.unwrap();
+
+            // Test search
+            for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
+                assert_eq!(
+                    sstable.search(key).await.unwrap().unwrap(),
+                    Value::Living(value.clone()),
+                );
+            }
+
+            // Test stream
+            let mut s = sstable.open_stream().await.unwrap();
+            let mut offset = 0;
+            while let Some(item) = s.next().await {
+                let (key, value) = item.unwrap();
+                assert_eq!(key, test_case_key[offset]);
+                assert_eq!(value, Value::living(test_case_value[offset].clone()));
+                offset += 1;
+            }
+
+            // Drop all access entry
+            clear_inactive_readers(0);
+        }
+
+        // Check MANAGER
+        assert!(!is_active_uuid(&uid.unwrap()));
     }
 }

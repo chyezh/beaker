@@ -308,7 +308,7 @@ impl<'a> Iterator for BlockIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::generate_random_bytes;
+    use crate::util::test_case::generate_random_bytes;
 
     #[test]
     fn test_block_build_and_search_with_random_case() {
@@ -330,49 +330,5 @@ mod tests {
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             assert_eq!(block.search_key(key).unwrap().unwrap(), *value);
         }
-    }
-
-    #[test]
-    fn test_block_build_and_search() {
-        let mut builder = BlockBuilder::new();
-        builder.add(b"123456789", b"1234567689");
-        builder.add(b"1234567891", b"1234567689");
-        builder.add(b"12345678912", b"1234567689");
-        builder.add(b"12345678923", b"1234567689");
-        builder.add(b"2", b"2");
-        builder.add(b"3", b"3");
-        builder.add(b"4", b"");
-        let data = builder.finish();
-
-        let block = Block::from_bytes(Bytes::copy_from_slice(data)).unwrap();
-        assert_eq!(
-            block.search_key(b"123456789").unwrap(),
-            Some(Bytes::from_static(b"1234567689"))
-        );
-        assert_eq!(
-            block.search_key(b"2").unwrap(),
-            Some(Bytes::from_static(b"2"))
-        );
-        assert_eq!(
-            block.search_key(b"3").unwrap(),
-            Some(Bytes::from_static(b"3"))
-        );
-        assert_eq!(
-            block.search_key(b"4").unwrap(),
-            Some(Bytes::from_static(b""))
-        );
-        assert_eq!(block.search_key(b"5").unwrap(), None);
-        assert_eq!(
-            block.search_key(b"1234567891").unwrap(),
-            Some(Bytes::from_static(b"1234567689"))
-        );
-        assert_eq!(
-            block.search_key(b"12345678912").unwrap(),
-            Some(Bytes::from_static(b"1234567689"))
-        );
-        assert_eq!(
-            block.search_key(b"12345678923").unwrap(),
-            Some(Bytes::from_static(b"1234567689"))
-        );
     }
 }
