@@ -4,19 +4,22 @@ use super::{
     compact::Compactor,
     manifest::Manifest,
     memtable::{DumpRequest, MemTable},
-    sstable::{SSTable, SSTableBuilder},
+    sstable,
     util::Value,
     Result,
 };
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::path::PathBuf;
-use tokio::{runtime::Handle, sync::mpsc::UnboundedReceiver};
+use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{info, warn};
 
+#[derive(Clone)]
 pub struct DB {
     manifest: Manifest,
     memtable: MemTable,
-    shutdown: Option<Notifier>,
+    shutdown: Arc<Mutex<Option<Notifier>>>,
 }
 
 impl DB {
@@ -25,10 +28,11 @@ impl DB {
         let path = path.into();
         let shutdown = Notifier::new();
 
-        let (manifest, compact_rx) = Manifest::open(path.clone())?;
+        let (manifest, compact_rx, clean_sstable_rx) = Manifest::open(path.clone())?;
         let (memtable, dump_rx) = MemTable::open(path)?;
 
         // Start a background task
+        // TODO: refactor into event-based
         // Transform memtable into level 0 sstable
         listen_dump(
             manifest.clone(),
@@ -37,10 +41,16 @@ impl DB {
             shutdown.listen().unwrap(),
         );
         listen_compact(manifest.clone(), compact_rx, shutdown.listen().unwrap());
+        listen_inactive_sstable_clean(
+            manifest.clone(),
+            clean_sstable_rx,
+            shutdown.listen().unwrap(),
+        );
+        listen_clear_inactive_readers(shutdown.listen().unwrap());
         Ok(DB {
             manifest,
             memtable,
-            shutdown: Some(shutdown),
+            shutdown: Arc::new(Mutex::new(Some(shutdown))),
         })
     }
 
@@ -56,9 +66,9 @@ impl DB {
 
         // Get possible sstables from manifest
         // Read sstable to search value
-        for sstable in self.manifest.search(key) {
-            let mut sstable = SSTable::open(sstable.open_reader().await?).await?;
-            if let Some(value) = sstable.search(key).await? {
+        for entry in self.manifest.search(key) {
+            let table = sstable::open(entry).await?;
+            if let Some(value) = table.search(key).await? {
                 match value {
                     Value::Living(v) => return Ok(Some(v)),
                     Value::Tombstone => return Ok(None),
@@ -81,8 +91,8 @@ impl DB {
     }
 
     // Shutdown the database, and drop the database
-    pub async fn shutdown(mut self) {
-        let mut shutdown = self.shutdown.take().unwrap();
+    pub async fn shutdown(self) {
+        let mut shutdown = self.shutdown.lock().take().unwrap();
         shutdown.notify().await;
     }
 }
@@ -95,6 +105,7 @@ fn listen_compact(
 ) {
     tokio::spawn(async move {
         info!("compact task listening...");
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             tokio::select! {
                 _ = shutdown_listener.listen() => {
@@ -103,24 +114,85 @@ fn listen_compact(
                 }
                 _ = listener.recv() => {
                     info!("start find new compact task...");
-                    for task in manifest.find_new_compact_tasks() {
-                        let manifest = manifest.clone();
-                        info!("compact task found, {:?}", task);
-
-                        // Hold a listener copy, to block shutdown util compact task finish
-                        let new_shutdown_listener = shutdown_listener.clone();
-                        tokio::spawn(async move {
-                            new_shutdown_listener.hold();
-                            if let Err(err) = Compactor::new(task, manifest).compact().await {
-                                warn!(error = err.to_string(), "compact task failed")
-                            }
-                        });
-                    }
+                    compact(&manifest, &shutdown_listener);
                     info!("finish find new compact task");
+                }
+                _ = interval.tick() => {
+                    info!("start find new compact task from timer...");
+                    compact(&manifest, &shutdown_listener);
+                    info!("finish find new compact task from timer");
                 }
             }
         }
         info!("stop creating new compact task");
+    });
+}
+
+// Do a compaction
+fn compact(manifest: &Manifest, shutdown_listener: &Listener) {
+    for task in manifest.find_new_compact_tasks() {
+        let manifest = manifest.clone();
+        info!("compact task found, {:?}", task);
+
+        // Hold a listener copy, to block shutdown util compact task finish
+        let new_shutdown_listener = shutdown_listener.clone();
+        tokio::spawn(async move {
+            new_shutdown_listener.hold();
+            if let Err(err) = Compactor::new(task, manifest).compact().await {
+                warn!(error = err.to_string(), "compact task failed")
+            }
+        });
+    }
+}
+
+// Listen sstable clean
+fn listen_inactive_sstable_clean(
+    manifest: Manifest,
+    mut listener: UnboundedReceiver<()>,
+    mut shutdown_listener: Listener,
+) {
+    tokio::spawn(async move {
+        info!("inactive sstable cleaner listening...");
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+
+        loop {
+            tokio::select! {
+                _ = shutdown_listener.listen() => {
+                    // Stop clean inactive sstable on disk
+                    break;
+                }
+                Some(_) = listener.recv() => {
+                    info!("start a new inactive sstable clean task from signal");
+                    if let Err(err) = manifest.clean_inactive_sstable().await {
+                        warn!(error = err.to_string(), "clean inactive sstable failed");
+                    }
+                }
+                _ = interval.tick() => {
+                    info!("start a new inactive sstable clean task from timer");
+                    if let Err(err) = manifest.clean_inactive_sstable().await {
+                        warn!(error = err.to_string(), "clean inactive sstable failed");
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn listen_clear_inactive_readers(mut shutdown_listener: Listener) {
+    tokio::spawn(async move {
+        info!("clear inactive reader listening...");
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = shutdown_listener.listen() => {
+                    break;
+                }
+                _ = interval.tick() => {
+                    info!("start clear inactive readers");
+                    sstable::clear_inactive_readers();
+                }
+            }
+        }
     });
 }
 
@@ -155,14 +227,12 @@ fn listen_dump(
 async fn dump(manifest: &Manifest, memtable: &MemTable, request: DumpRequest) -> Result<()> {
     // Build a new sstable from memtable if memtable is not empty
     if request.len() != 0 {
-        let mut entry = manifest.alloc_new_sstable_entry(0);
-        let mut builder = SSTableBuilder::new(entry.open_writer().await?);
+        let entry = manifest.alloc_new_sstable_entry(0);
+        let mut builder = entry.open_builder().await?;
         for (key, value) in request.iter() {
             builder.add(key.clone(), value.clone()).await?;
         }
-
-        let range = builder.finish().await?;
-        entry.set_range(range);
+        let entry = builder.finish().await?;
 
         // Register the new sstable into manifest
         manifest.add_new_sstable(entry)?;
@@ -176,6 +246,8 @@ async fn dump(manifest: &Manifest, memtable: &MemTable, request: DumpRequest) ->
 
 #[cfg(test)]
 mod tests {
+
+    use std::arch::x86_64::_mm256_shuffle_epi8;
 
     use super::*;
     use crate::util::generate_random_bytes;
@@ -223,12 +295,24 @@ mod tests {
     }
 
     #[test(flavor = "multi_thread", worker_threads = 3)]
+    async fn test_db_with_sequence_number2() {
+        // Reopen db and test get
+        let db = DB::open("./data").unwrap();
+        let test_count = 10000000;
+
+        //for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
+        //{
+        //    assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
+        //}
+    }
+
+    #[test(flavor = "multi_thread", worker_threads = 3)]
     async fn test_db_with_sequence_number() {
         let _ = env_logger::builder().is_test(true).try_init();
         tracing::info!("start testing");
 
         let mut rng = rand::thread_rng();
-        let test_count = 1000000;
+        let test_count = 10000000;
         let db = DB::open("./data").unwrap();
 
         // Set db
@@ -275,6 +359,7 @@ mod tests {
                 assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
             }
         }
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
     }
 
     fn sequence_number_iter(max: usize) -> impl Iterator<Item = Bytes> {

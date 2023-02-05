@@ -8,6 +8,7 @@ mod util;
 
 mod db;
 pub use db::DB;
+
 mod error;
 pub use error::Error;
 

@@ -5,11 +5,49 @@ use super::{
 };
 use crate::util::{async_util::seek_and_read_buf, checksum, from_le_bytes_32, from_le_bytes_64};
 use bytes::Bytes;
-use std::io::SeekFrom;
-use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt};
+use lazy_static::lazy_static;
+use parking_lot::RwLock;
+use std::{
+    collections::{HashMap, HashSet},
+    io::{SeekFrom, Write},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, AtomicU8, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
+use tokio::{
+    fs::File,
+    io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt},
+    sync::Mutex,
+};
+use tracing::info;
+use uuid::Uuid;
 
 const FOOTER_SIZE: usize = 12; // 12bytes
 const BLOCK_DEFAULT_SIZE: usize = 4 * 1024; // 4kb
+pub const SSTABLE_FILE_EXTENSION: &str = "tbl";
+const MINIMUM_SSTABLE_ENTRY_SIZE: usize = 28;
+
+lazy_static! {
+    // Global sstable manager
+    pub static ref MANAGER: SSTableManager<File> = SSTableManager::new();
+
+    static ref ORIGINAL_INSTANT: Instant = Instant::now();
+}
+
+pub async fn open(entry: Arc<SSTableEntry>) -> Result<Arc<SSTable<File>>> {
+    MANAGER.open(entry).await
+}
+
+pub fn clear_inactive_readers() {
+    MANAGER.clear_inactive_readers();
+}
+
+pub fn is_active_uuid(uid: &Uuid) -> bool {
+    MANAGER.is_active_uuid(uid)
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct SSTableRange {
@@ -17,6 +55,7 @@ pub struct SSTableRange {
     pub right: Bytes,
 }
 
+// Describe range info of sstable
 impl SSTableRange {
     // Get minimum contain two range
     pub fn get_minimum_contain(&mut self, other: &SSTableRange) {
@@ -52,14 +91,189 @@ impl SSTableRange {
     }
 }
 
-pub struct SSTable<R> {
-    index: Index,
-    reader: R,
-    range: SSTableRange, // Key range of this table [xxx, xxx]
+// SSTableEntry is the unique entry of single sstable file, hold by manifest, SSTable, SSTableStream by using reference count
+// SSTableEntry would never modified if sstable file's construction was finished
+// When SSTableEntry is dropped except termination of system, no more read operation would do on sstable file and ssTable file can be removed safely
+#[derive(Debug)]
+pub struct SSTableEntry {
+    pub lv: usize,
+    pub uid: Uuid,
+    pub range: SSTableRange,
+    pub root_path: PathBuf,
+    compact_lock: AtomicU8,
 }
 
-impl<R: AsyncSeek + AsyncRead + Unpin> SSTable<R> {
-    pub async fn open(mut reader: R) -> Result<Self> {
+impl SSTableEntry {
+    // Create a new SSTableEntry
+    pub fn new(lv: usize, root_path: PathBuf) -> Self {
+        let uid = Uuid::new_v4();
+        // Register uid into global manager
+        MANAGER.register_entry(uid);
+
+        SSTableEntry {
+            lv,
+            uid,
+            root_path,
+            range: SSTableRange::default(),
+            compact_lock: AtomicU8::new(0),
+        }
+    }
+
+    // Parse sstable entry from bytes
+    pub fn decode_from_bytes(root_path: PathBuf, data: Bytes) -> Result<Self> {
+        debug_assert!(data.len() >= MINIMUM_SSTABLE_ENTRY_SIZE);
+        if data.len() < MINIMUM_SSTABLE_ENTRY_SIZE {
+            return Err(Error::IllegalSSTableEntry);
+        }
+
+        let lv = from_le_bytes_32(&data[0..4]);
+        let uid = Uuid::from_bytes_le((&data[4..20]).try_into().unwrap());
+
+        // Parsing range
+        let left_boundary_len = from_le_bytes_32(&data[20..24]);
+        debug_assert!(data.len() >= MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len);
+        if data.len() < MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len {
+            return Err(Error::IllegalSSTableEntry);
+        }
+        let right_boundary_len_start = 24 + left_boundary_len;
+        let left_boundary = data.slice(24..right_boundary_len_start);
+
+        let right_boundary_len =
+            from_le_bytes_32(&data[right_boundary_len_start..right_boundary_len_start + 4]);
+        debug_assert_eq!(
+            data.len(),
+            MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len + right_boundary_len
+        );
+        if data.len() != MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len + right_boundary_len {
+            return Err(Error::IllegalSSTableEntry);
+        }
+        let right_boundary = data
+            .slice(right_boundary_len_start + 4..right_boundary_len_start + 4 + right_boundary_len);
+
+        // Check if sstable file exist
+        if !Self::file_path(root_path.clone(), &uid).is_file() {
+            return Err(Error::IllegalSSTableEntry);
+        }
+
+        // Register uid into global manager
+        MANAGER.register_entry(uid);
+        Ok(SSTableEntry {
+            lv,
+            uid,
+            root_path,
+            compact_lock: AtomicU8::new(0),
+            range: SSTableRange {
+                left: left_boundary,
+                right: right_boundary,
+            },
+        })
+    }
+
+    // Consume the entry and open a builder of this entry
+    pub async fn open_builder(self) -> Result<SSTableBuilder<File>> {
+        let path = Self::file_path(self.root_path.clone(), &self.uid);
+        let new_file = tokio::fs::OpenOptions::new()
+            .truncate(true)
+            .create(true)
+            .write(true)
+            .open(path)
+            .await?;
+
+        Ok(SSTableBuilder {
+            writer: new_file,
+            data_block: BlockBuilder::new(),
+            index_block: BlockBuilder::new(),
+            last_key: Vec::with_capacity(128),
+            offset: 0,
+            complete_data_block_size: 0,
+            range: (None, None),
+            entry: self,
+        })
+    }
+
+    // Get encode bytes length for pre-allocation
+    #[inline]
+    pub fn encode_bytes_len(&self) -> usize {
+        MINIMUM_SSTABLE_ENTRY_SIZE + self.range.left.len() + self.range.right.len()
+    }
+
+    // Encode into bytes and write to given Write
+    // 1. 0-4 lv
+    // 2. 4-20 uuid
+    // 3. length of range's left boundary
+    // 4. left boundary
+    // 5. length of range's right boundary
+    // 6. right boundary
+    pub fn encode_to<W: Write>(&self, mut w: W) -> Result<()> {
+        w.write_all(&self.lv.to_le_bytes()[0..4])?;
+        w.write_all(&self.uid.to_bytes_le())?;
+        w.write_all(&self.range.left.len().to_le_bytes()[0..4])?;
+        w.write_all(&self.range.left)?;
+        w.write_all(&self.range.right.len().to_le_bytes()[0..4])?;
+        w.write_all(&self.range.right)?;
+        Ok(())
+    }
+
+    // Try to lock for compact process
+    pub fn try_compact_lock(&self) -> Result<()> {
+        // Just keep atomic, no memory barrier needed
+        self.compact_lock
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::SSTableEntryLockFailed)?;
+        Ok(())
+    }
+
+    // release compact lock
+    pub fn release_lock(&self) {
+        // release the lock
+        self.compact_lock.store(0, Ordering::Release);
+    }
+
+    pub fn sort_key(&self) -> Bytes {
+        self.range.left.clone()
+    }
+
+    pub fn file_path(root_path: PathBuf, uid: &Uuid) -> PathBuf {
+        let file_name = format!("{}.{}", uid, SSTABLE_FILE_EXTENSION);
+        root_path.join(file_name)
+    }
+
+    // Open a sstable reader for this file
+    #[inline]
+    async fn open_reader(&self) -> Result<File> {
+        let path = Self::file_path(self.root_path.clone(), &self.uid);
+        let new_file = File::open(path).await?;
+        Ok(new_file)
+    }
+
+    // Set range into entry
+    #[inline]
+    fn set_range(&mut self, range: SSTableRange) {
+        debug_assert!(range.left <= range.right);
+        self.range = range;
+    }
+}
+
+impl Drop for SSTableEntry {
+    fn drop(&mut self) {
+        MANAGER.drop_entry(&self.uid);
+    }
+}
+
+pub struct SSTable<R: AsyncRead + AsyncSeek + Unpin> {
+    index: Arc<Index>,
+    reader: Arc<Mutex<R>>,
+    entry: Arc<SSTableEntry>,
+    create_time: Instant,
+    last_access: AtomicU64,
+}
+
+impl SSTable<File> {
+    // Open a new SSTable with given entry and Parsing index into memory
+    // Hold the entry and unique reader util SSTable is dropped
+    async fn open(entry: Arc<SSTableEntry>) -> Result<Self> {
+        let mut reader = entry.open_reader().await?;
+
         // Recover footer from file
         let footer_buffer = seek_and_read_buf(
             &mut reader,
@@ -110,44 +324,34 @@ impl<R: AsyncSeek + AsyncRead + Unpin> SSTable<R> {
             return Err(Error::BadSSTable);
         }
 
-        let first_block = Block::from_bytes(block_buffer.into())?;
-        let (first_key, _) = first_block.iter().next().ok_or(Error::BadSSTable)??;
-        // Get last key
-        let last_block = if index.index.len() == 1 {
-            // Single block in index
-            first_block
-        } else {
-            let last_block = index.index.last().ok_or(Error::BadSSTable)?;
-            let block_buffer = seek_and_read_buf(
-                &mut reader,
-                SeekFrom::Start(last_block.offset),
-                last_block.size,
-            )
-            .await?;
-            debug_assert_eq!(block_buffer.len(), last_block.size);
-            if block_buffer.len() != last_block.size {
-                return Err(Error::BadSSTable);
-            }
-            Block::from_bytes(block_buffer.into())?
-        };
-
-        let mut last_key = Bytes::new();
-        for pair in last_block.iter() {
-            last_key = pair?.0;
-        }
-
         Ok(SSTable {
-            index,
-            reader,
-            range: SSTableRange {
-                left: first_key,
-                right: last_key,
-            },
+            index: Arc::new(index),
+            reader: Arc::new(Mutex::new(reader)),
+            entry,
+            create_time: Instant::now(),
+            last_access: AtomicU64::new(0),
         })
     }
 
-    pub async fn search(&mut self, key: &[u8]) -> Result<Option<Value>> {
-        if !self.range.in_range(key) {
+    // Open a new stream of this SSTable, any operation of stream is independent with this SSTable
+    pub async fn open_stream(&self) -> Result<SSTableStream<File>> {
+        // Open a independent reader for stream
+        let reader = self.entry.open_reader().await?;
+        Ok(SSTableStream {
+            block: None,
+            index: Arc::clone(&self.index),
+            index_offset: 0,
+            reader,
+            stop: false,
+            entry: Arc::clone(&self.entry),
+        })
+    }
+}
+
+impl<R: AsyncRead + AsyncSeek + Unpin> SSTable<R> {
+    // Get value in this sstable with given key
+    pub async fn search(&self, key: &[u8]) -> Result<Option<Value>> {
+        if !self.entry.range.in_range(key) {
             return Ok(None);
         }
 
@@ -156,15 +360,21 @@ impl<R: AsyncSeek + AsyncRead + Unpin> SSTable<R> {
             .index
             .binary_search_by_key(&key, |elem| &elem.key[..])
             .unwrap_or_else(|x| x);
+
         debug_assert!(search_index < self.index.index.len());
 
         let block_info = &self.index.index[search_index];
-        let block_buffer = seek_and_read_buf(
-            &mut self.reader,
-            SeekFrom::Start(block_info.offset),
-            block_info.size,
-        )
-        .await?;
+
+        // Acquire file reader lock
+        let block_buffer = {
+            let mut reader = self.reader.lock().await;
+            seek_and_read_buf(
+                &mut *reader,
+                SeekFrom::Start(block_info.offset),
+                block_info.size,
+            )
+            .await?
+        };
         debug_assert_eq!(block_buffer.len(), block_info.size);
         if block_buffer.len() != block_info.size {
             return Err(Error::BadSSTable);
@@ -176,25 +386,35 @@ impl<R: AsyncSeek + AsyncRead + Unpin> SSTable<R> {
         Ok(None)
     }
 
-    pub fn into_stream(self) -> SSTableStream<R> {
-        SSTableStream {
-            block: None,
-            index: self.index.index.into_iter(),
-            reader: self.reader,
-            stop: false,
-        }
+    // Refresh last access time
+    #[inline]
+    fn refresh_last_access(&self) {
+        self.last_access.store(
+            Instant::now().duration_since(self.create_time).as_secs(),
+            Ordering::Release,
+        );
+    }
+
+    // SSTable is active if someone access it one minute ago
+    #[inline]
+    fn is_active(&self) -> bool {
+        let last_access = self.last_access.load(Ordering::Acquire);
+        (Instant::now().duration_since(self.create_time).as_secs() - last_access) < 60
     }
 }
 
-pub struct SSTableStream<R> {
+// A async iterator iterating whole sstable key-value pair for compaction
+pub struct SSTableStream<R: AsyncRead + AsyncSeek + Unpin> {
     block: Option<BlockIntoIterator>,
-    index: std::vec::IntoIter<BlockItem>,
+    index: Arc<Index>,
+    index_offset: usize,
     reader: R,
     stop: bool,
+    entry: Arc<SSTableEntry>,
 }
 
 // Implement a Iterator to iterating the sstable
-impl<R: AsyncSeek + AsyncRead + Unpin> SSTableStream<R> {
+impl<R: AsyncRead + AsyncSeek + Unpin> SSTableStream<R> {
     pub async fn next(&mut self) -> Option<Result<(Bytes, Value)>> {
         if self.stop {
             return None;
@@ -232,7 +452,8 @@ impl<R: AsyncSeek + AsyncRead + Unpin> SSTableStream<R> {
                 None => {
                     // Read a new block
                     // Search index if block is none
-                    if let Some(block_item) = self.index.next() {
+                    if let Some(block_item) = self.index.index.get(self.index_offset) {
+                        self.index_offset += 1;
                         // Read a new block
                         let block_buffer = seek_and_read_buf(
                             &mut self.reader,
@@ -259,7 +480,7 @@ impl<R: AsyncSeek + AsyncRead + Unpin> SSTableStream<R> {
                             // Unexpected error occurred
                             // Stop iteration
                             self.stop = true;
-                            return Some(Err(e.into()));
+                            return Some(Err(e));
                         }
 
                         self.block = Some(block.unwrap().into_iter());
@@ -347,6 +568,93 @@ impl Index {
     }
 }
 
+pub struct SSTableManager<R: AsyncRead + AsyncSeek + Unpin> {
+    readers: Arc<RwLock<HashMap<Uuid, Arc<SSTable<R>>>>>,
+    active_entry_uid: Arc<parking_lot::Mutex<HashSet<Uuid>>>,
+    instant_reference: Instant,
+}
+
+impl SSTableManager<File> {
+    // Open a sstable with a cache layer
+    async fn open(&self, entry: Arc<SSTableEntry>) -> Result<Arc<SSTable<File>>> {
+        // Check whether sstable is already open in cache
+        {
+            let tables = self.readers.read();
+            if let Some(table) = tables.get(&entry.uid) {
+                // Update last access time
+                table.refresh_last_access();
+                return Ok(Arc::clone(table));
+            }
+        }
+        // If sstable is not found in cache, open sstable and add to cache
+        let new_table = SSTable::open(Arc::clone(&entry)).await?;
+
+        let mut tables = self.readers.write();
+        let table = tables
+            .entry(entry.uid)
+            .or_insert_with(|| Arc::new(new_table));
+
+        // Update last access time
+        table.refresh_last_access();
+
+        info!("new sstable reader was opened, uuid: {}", entry.uid);
+        Ok(Arc::clone(table))
+    }
+
+    // Clear all inactive readers
+    pub fn clear_inactive_readers(&self) {
+        // Pre-find all inactive reader, avoid acquire write lock
+        let mut uid_list = Vec::new();
+        {
+            let reader = self.readers.read();
+            for (uid, sstable) in reader.iter() {
+                if !sstable.is_active() {
+                    uid_list.push(*uid);
+                }
+            }
+        }
+
+        if uid_list.is_empty() {
+            return;
+        }
+
+        // Remove all inactive reader
+        // Inconsistency is allowed, path not hit cache in open function was executed in worst case
+        let mut reader = self.readers.write();
+        for uid in uid_list {
+            info!("inactive sstable reader was remove, uuid: {}", uid);
+            reader.remove(&uid);
+        }
+    }
+
+    // Create a manager
+    fn new() -> Self {
+        SSTableManager {
+            readers: Arc::new(RwLock::new(HashMap::new())),
+            active_entry_uid: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            instant_reference: Instant::now(),
+        }
+    }
+
+    // Check if a uid is still active
+    #[inline]
+    fn is_active_uuid(&self, uid: &Uuid) -> bool {
+        self.active_entry_uid.lock().contains(uid)
+    }
+
+    // Add entry uid if created
+    #[inline]
+    fn register_entry(&self, uid: Uuid) {
+        self.active_entry_uid.lock().insert(uid);
+    }
+
+    // Remove entry uid if drop
+    #[inline]
+    fn drop_entry(&self, uid: &Uuid) {
+        self.active_entry_uid.lock().remove(uid);
+    }
+}
+
 // Build a single sstable, use leveldb definition without filter block.
 pub struct SSTableBuilder<W> {
     writer: W,
@@ -356,21 +664,10 @@ pub struct SSTableBuilder<W> {
     offset: u64,
     complete_data_block_size: usize,
     range: (Option<Bytes>, Option<Bytes>),
+    entry: SSTableEntry,
 }
 
 impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
-    pub fn new(writer: W) -> Self {
-        SSTableBuilder {
-            writer,
-            data_block: BlockBuilder::new(),
-            index_block: BlockBuilder::new(),
-            last_key: Vec::with_capacity(128),
-            offset: 0,
-            complete_data_block_size: 0,
-            range: (None, None),
-        }
-    }
-
     // Add a new key to sstable and return size estimate
     pub async fn add(&mut self, key: Bytes, value: Value) -> Result<usize> {
         self.data_block.add(&key, &value.to_bytes());
@@ -397,8 +694,8 @@ impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
         Ok(complete_data_block_size + block_size + self.index_block.size_estimate())
     }
 
-    // Finish a table construction, and get the sstable range
-    pub async fn finish(&mut self) -> Result<SSTableRange> {
+    // Finish a table construction, and get the sstable entry
+    pub async fn finish(mut self) -> Result<SSTableEntry> {
         debug_assert!(self.range.0.is_some());
         debug_assert!(self.range.1.is_some());
 
@@ -426,10 +723,13 @@ impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
             .write_all(&Footer::new(index_offset, index_size).to_bytes())
             .await?;
 
-        Ok(SSTableRange {
+        // Set range into entry
+        self.entry.set_range(SSTableRange {
             left: self.range.0.as_ref().unwrap().clone(),
             right: self.range.1.as_ref().unwrap().clone(),
-        })
+        });
+
+        Ok(self.entry)
     }
 
     #[inline]
@@ -458,181 +758,8 @@ impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
             .write_all(&checksum(data).to_le_bytes()[0..4])
             .await?;
         self.data_block.reset();
-
         self.offset += data_size as u64 + 4; // advance offset(data_size + checksum_size)
 
         Ok((offset, data_size))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::util::generate_random_bytes;
-
-    use super::*;
-    use bytes::Bytes;
-    use std::io::Cursor;
-    use tokio::test;
-
-    #[test]
-    async fn test_table_build_and_search_with_random_case() {
-        let (test_case_key, test_case_value, mut table) =
-            create_new_table_with_random_case(1000).await;
-        for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            assert_eq!(
-                table.search(key).await.unwrap().unwrap(),
-                Value::living(value.clone())
-            );
-        }
-    }
-
-    #[test]
-    async fn test_compact_table_with_random_case() {
-        let (test_case_key_1, test_case_value_1, mut table_1) =
-            create_new_table_with_random_case(1500).await;
-        for (key, value) in test_case_key_1.iter().zip(test_case_value_1.iter()) {
-            assert_eq!(
-                table_1.search(key).await.unwrap().unwrap(),
-                Value::living(value.clone())
-            );
-        }
-
-        let (test_case_key_2, test_case_value_2, mut table_2) =
-            create_new_table_with_random_case(1000).await;
-        for (key, value) in test_case_key_2.iter().zip(test_case_value_2.iter()) {
-            assert_eq!(
-                table_2.search(key).await.unwrap().unwrap(),
-                Value::living(value.clone())
-            );
-        }
-
-        // Build up table
-        // let mut builder = SSTableBuilder::new(Vec::new());
-        // compact_sstable(table_1, table_2, &mut builder).unwrap();
-
-        // // test search operation
-        // let writer = builder.writer;
-        // let buffer = Cursor::new(writer);
-        // let mut table = SSTable::open(buffer).unwrap();
-
-        // let kv_1: HashMap<_, _> = test_case_key_1
-        //     .iter()
-        //     .zip(test_case_value_1.iter())
-        //     .collect();
-
-        // let kv_2: HashMap<_, _> = test_case_key_2
-        //     .iter()
-        //     .zip(test_case_value_2.iter())
-        //     .collect();
-
-        // for key in test_case_key_1.iter().chain(test_case_key_2.iter()) {
-        //     let value = table.search_key(key).unwrap().unwrap();
-        //     // Checkout table 2 first
-        //     if let Some(value2) = kv_2.get(key) {
-        //         assert_eq!(value, **value2);
-        //         continue;
-        //     }
-        //     if let Some(value2) = kv_1.get(key) {
-        //         assert_eq!(value, **value2);
-        //         continue;
-        //     }
-        //     panic!("key lost after compaction");
-        // }
-    }
-
-    async fn create_new_table_with_random_case(
-        test_count: usize,
-    ) -> (Vec<Bytes>, Vec<Bytes>, SSTable<Cursor<Bytes>>) {
-        // Generate random test case
-        let mut test_case_key = generate_random_bytes(test_count, 10000);
-        let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
-        test_case_key.sort();
-
-        // Build up table
-        let mut builder = SSTableBuilder::new(Vec::new());
-        for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            builder
-                .add(key.clone(), Value::living(value.clone()))
-                .await
-                .unwrap();
-        }
-        builder.finish().await.unwrap();
-
-        // test search operation
-        let buffer = Cursor::new(Bytes::from(builder.writer));
-        let table = SSTable::open(buffer).await.unwrap();
-
-        (test_case_key, test_case_value, table)
-    }
-
-    #[test]
-    async fn test_table_build_and_search() {
-        use std::io::Cursor;
-
-        let v = Vec::new();
-        let mut builder = SSTableBuilder::new(v);
-        builder
-            .add(
-                Bytes::from_static(b"123456789"),
-                Value::living_static(b"1234567689"),
-            )
-            .await
-            .unwrap();
-        builder
-            .add(
-                Bytes::from_static(b"1234567891"),
-                Value::living_static(b"1234567689"),
-            )
-            .await
-            .unwrap();
-        builder
-            .add(
-                Bytes::from_static(b"12345678912"),
-                Value::living_static(b"1234567689"),
-            )
-            .await
-            .unwrap();
-        builder
-            .add(
-                Bytes::from_static(b"12345678923"),
-                Value::living_static(b"1234567689"),
-            )
-            .await
-            .unwrap();
-        builder
-            .add(Bytes::from_static(b"2"), Value::living_static(b"2"))
-            .await
-            .unwrap();
-        builder
-            .add(Bytes::from_static(b"3"), Value::living_static(b"3"))
-            .await
-            .unwrap();
-        builder
-            .add(Bytes::from_static(b"4"), Value::living_static(b""))
-            .await
-            .unwrap();
-        builder.finish().await.unwrap();
-
-        let v = Cursor::new(builder.writer);
-        let mut table = SSTable::open(v).await.unwrap();
-
-        let result = table.search(b"123456789").await.unwrap().unwrap();
-        assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search(b"1234567891").await.unwrap().unwrap();
-        assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search(b"12345678912").await.unwrap().unwrap();
-        assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search(b"12345678923").await.unwrap().unwrap();
-        assert_eq!(result, Value::living_static(b"1234567689"));
-        let result = table.search(b"2").await.unwrap().unwrap();
-        assert_eq!(result, Value::living_static(b"2"));
-        let result = table.search(b"3").await.unwrap().unwrap();
-        assert_eq!(result, Value::living_static(b"3"));
-        let result = table.search(b"4").await.unwrap().unwrap();
-        assert_eq!(result, Value::living_static(b""));
-        assert!(table.search(b"1000").await.unwrap().is_none());
-        assert!(table.search(b"1").await.unwrap().is_none());
-        assert!(table.search(b"666").await.unwrap().is_none());
-        assert!(table.search(b"5").await.unwrap().is_none());
     }
 }

@@ -1,5 +1,5 @@
 use super::record::RecordWriter;
-use super::sstable::SSTableRange;
+use super::sstable::{self, SSTableEntry};
 use super::util::scan_sorted_file_at_path;
 use super::{Error, Result};
 use crate::leveldb::record::RecordReader;
@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{info, warn};
@@ -21,137 +21,6 @@ const MANIFEST_FILE_EXTENSION: &str = "manifest";
 const MINIMUM_SSTABLE_ENTRY_SIZE: usize = 28;
 const MINIMUM_MANIFEST_INNER_SIZE: usize = 8;
 const SPLIT_MANIFEST_SIZE_THRESHOLD: usize = 32 * 1024 * 1024; // 32MB
-
-#[derive(Debug)]
-pub struct SSTableEntry {
-    lv: usize,
-    uid: Uuid,
-    root_path: PathBuf,
-    range: SSTableRange,
-    compact_lock: AtomicU8,
-}
-
-impl SSTableEntry {
-    // Open a sstable reader for this file
-    pub async fn open_reader(&self) -> Result<tokio::fs::File> {
-        let path = Self::file_path(self.root_path.clone(), &self.uid);
-        let new_file = tokio::fs::File::open(path).await?;
-        Ok(new_file)
-    }
-
-    // Open a sstable writer for this file
-    pub async fn open_writer(&self) -> Result<tokio::fs::File> {
-        // TODO: file_lock
-        let path = Self::file_path(self.root_path.clone(), &self.uid);
-        let new_file = tokio::fs::OpenOptions::new()
-            .truncate(true)
-            .create(true)
-            .write(true)
-            .open(path)
-            .await?;
-        Ok(new_file)
-    }
-
-    pub fn set_range(&mut self, range: SSTableRange) {
-        debug_assert!(range.left <= range.right);
-        self.range = range;
-    }
-
-    // Get encode bytes length for pre-allocation
-    #[inline]
-    fn encode_bytes_len(&self) -> usize {
-        MINIMUM_SSTABLE_ENTRY_SIZE + self.range.left.len() + self.range.right.len()
-    }
-
-    // Encode into bytes and write to given Write
-    // 1. 0-4 lv
-    // 2. 4-20 uuid
-    // 3. length of range's left boundary
-    // 4. left boundary
-    // 5. length of range's right boundary
-    // 6. right boundary
-    fn encode_to<W: Write>(&self, mut w: W) -> Result<()> {
-        w.write_all(&self.lv.to_le_bytes()[0..4])?;
-        w.write_all(&self.uid.to_bytes_le())?;
-        w.write_all(&self.range.left.len().to_le_bytes()[0..4])?;
-        w.write_all(&self.range.left)?;
-        w.write_all(&self.range.right.len().to_le_bytes()[0..4])?;
-        w.write_all(&self.range.right)?;
-        Ok(())
-    }
-
-    // Parse sstable entry from bytes
-    fn decode_from_bytes(root_path: PathBuf, data: Bytes) -> Result<Self> {
-        debug_assert!(data.len() >= MINIMUM_SSTABLE_ENTRY_SIZE);
-        if data.len() < MINIMUM_SSTABLE_ENTRY_SIZE {
-            return Err(Error::IllegalSSTableEntry);
-        }
-
-        let lv = from_le_bytes_32(&data[0..4]);
-        let uid = Uuid::from_bytes_le((&data[4..20]).try_into().unwrap());
-
-        // Parsing range
-        let left_boundary_len = from_le_bytes_32(&data[20..24]);
-        debug_assert!(data.len() >= MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len);
-        if data.len() < MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len {
-            return Err(Error::IllegalSSTableEntry);
-        }
-        let right_boundary_len_start = 24 + left_boundary_len;
-        let left_boundary = data.slice(24..right_boundary_len_start);
-
-        let right_boundary_len =
-            from_le_bytes_32(&data[right_boundary_len_start..right_boundary_len_start + 4]);
-        debug_assert_eq!(
-            data.len(),
-            MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len + right_boundary_len
-        );
-        if data.len() != MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len + right_boundary_len {
-            return Err(Error::IllegalSSTableEntry);
-        }
-        let right_boundary = data
-            .slice(right_boundary_len_start + 4..right_boundary_len_start + 4 + right_boundary_len);
-
-        // Check if sstable file exist
-        if !Self::file_path(root_path.clone(), &uid).is_file() {
-            return Err(Error::IllegalSSTableEntry);
-        }
-
-        Ok(SSTableEntry {
-            lv,
-            uid,
-            root_path,
-            compact_lock: AtomicU8::new(0),
-            range: SSTableRange {
-                left: left_boundary,
-                right: right_boundary,
-            },
-        })
-    }
-
-    // Try to lock for compact process
-    fn try_compact_lock(&self) -> Result<()> {
-        // Just keep atomic, no memory barrier needed
-        self.compact_lock
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Error::SSTableEntryLockFailed)?;
-        Ok(())
-    }
-
-    // release compact lock
-    fn release_lock(&self) {
-        // release the lock
-        self.compact_lock.store(0, Ordering::Release);
-    }
-
-    fn file_path(root_path: PathBuf, uid: &Uuid) -> PathBuf {
-        let file_name = format!("{}.{}", uid, SSTABLE_FILE_EXTENSION);
-        root_path.join(file_name)
-    }
-
-    fn sort_key(&self) -> Bytes {
-        self.range.left.clone()
-    }
-}
 
 #[derive(Clone, Default, Debug)]
 struct ManifestInner {
@@ -270,7 +139,7 @@ impl ManifestPersister {
         manifest.encode_to(&mut buffer)?;
         self.log.append(buffer.into())?;
 
-        // Try to remove old manifest
+        // TODO: make async
         if need_clear {
             self.clear_old_manifest();
         }
@@ -305,11 +174,14 @@ pub struct Manifest {
     persister: Arc<Mutex<ManifestPersister>>,
     root_path: PathBuf,
     compact_tx: UnboundedSender<()>,
+    clean_sstable_tx: UnboundedSender<()>,
 }
 
 impl Manifest {
     // Open a new manifest record
-    pub fn open(root_path: impl Into<PathBuf>) -> Result<(Self, UnboundedReceiver<()>)> {
+    pub fn open(
+        root_path: impl Into<PathBuf>,
+    ) -> Result<(Self, UnboundedReceiver<()>, UnboundedReceiver<()>)> {
         // Try to create manifest root directory
         let root_path: PathBuf = root_path.into();
         fs::create_dir_all(sstable_root_path(&root_path))?;
@@ -348,7 +220,8 @@ impl Manifest {
         };
         // Open new persister
         let mut persister = ManifestPersister::open(manifest_root_path(&root_path), next_log_seq)?;
-        let (compact_tx, rx) = unbounded_channel();
+        let (compact_tx, compact_rx) = unbounded_channel();
+        let (clean_sstable_tx, clean_sstable_rx) = unbounded_channel();
 
         // Persist manifest to the newest log and clear old manifest log
         persister.persist(&inner)?;
@@ -360,21 +233,16 @@ impl Manifest {
                 root_path,
                 persister: Arc::new(Mutex::new(persister)),
                 compact_tx,
+                clean_sstable_tx,
             },
-            rx,
+            compact_rx,
+            clean_sstable_rx,
         ))
     }
 
     // Alloc a new sstable entry, and return its writer
     pub fn alloc_new_sstable_entry(&self, lv: usize) -> SSTableEntry {
-        let uid = Uuid::new_v4();
-        SSTableEntry {
-            uid,
-            root_path: sstable_root_path(&self.root_path),
-            lv,
-            range: SSTableRange::default(),
-            compact_lock: AtomicU8::new(0),
-        }
+        SSTableEntry::new(lv, sstable_root_path(&self.root_path))
     }
 
     // Add a new sstable file into manifest, persist modification and update in-memory manifest
@@ -469,15 +337,11 @@ impl Manifest {
         *manifest = new_manifest;
 
         // Clear old files
-        for table in task.low_lv.tables.iter().chain(task.high_lv.tables.iter()) {
-            if let Err(err) =
-                fs::remove_file(SSTableEntry::file_path(table.root_path.clone(), &table.uid))
-            {
-                warn!(
-                    error = err.to_string(),
-                    "remove old expired sstable file failed"
-                );
-            }
+        if let Err(err) = self.clean_sstable_tx.send(()) {
+            info!(
+                error = err.to_string(),
+                "receiver for clean sstable trigger has been released"
+            );
         }
 
         // Trigger to find new compact task
@@ -546,6 +410,34 @@ impl Manifest {
         }
 
         tasks
+    }
+
+    // Clean the inactive sstable on disk
+    pub async fn clean_inactive_sstable(&self) -> Result<()> {
+        let path = sstable_root_path(&self.root_path);
+        let mut reader = tokio::fs::read_dir(&path).await?;
+        while let Ok(Some(entry)) = reader.next_entry().await {
+            // Parse uid from filename
+            let filepath = entry.path();
+            if !filepath.is_file()
+                || filepath.extension() != Some(sstable::SSTABLE_FILE_EXTENSION.as_ref())
+            {
+                continue;
+            }
+
+            if let Some(Ok(uid)) = filepath
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .map(Uuid::from_str)
+            {
+                if !sstable::is_active_uuid(&uid) {
+                    // Remove inactive uuid file
+                    tokio::fs::remove_file(filepath).await?;
+                    info!("remove inactive sstable file, {}", uid);
+                }
+            }
+        }
+        Ok(())
     }
 }
 

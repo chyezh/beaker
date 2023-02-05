@@ -1,21 +1,22 @@
 use super::{connection::Connection, Result};
 
 use crate::cmd::Command;
-use crate::engine::Engine;
+use crate::leveldb::DB;
 use crate::resp::Frame;
+use bytes::Bytes;
 
 // Process a connection sequentially.
 // 1. Transfer connection frame into command
 // 2. Send command to DB engine
 // 3. Transfer result of command into frame and write to connection.
 pub struct Handler {
-    db: Engine,
+    db: DB,
     conn: Connection,
 }
 
 impl Handler {
     // Create a new handler with given db engine and connection
-    pub fn new(db: Engine, conn: Connection) -> Self {
+    pub fn new(db: DB, conn: Connection) -> Self {
         Handler { db, conn }
     }
 
@@ -37,19 +38,22 @@ impl Handler {
 }
 
 // Apply command to db engine, and write result of command into connection
-async fn apply(cmd: &Command, db: Engine, conn: &mut Connection) -> Result<()> {
+async fn apply(cmd: &Command, db: DB, conn: &mut Connection) -> Result<()> {
     conn.write_frame(&match cmd {
-        Command::Get(get) => match db.get(get.key()).await? {
+        Command::Get(get) => match db
+            .get(&Bytes::copy_from_slice(get.key().as_bytes()))
+            .await?
+        {
             Some(val) => Frame::Bulk(val),
             None => Frame::Null,
         },
         Command::Ping(_) => Frame::Simple("pong".into()),
         Command::Set(set) => {
-            db.set(set.key(), set.val()).await?;
+            db.set(Bytes::copy_from_slice(set.key().as_bytes()), set.val())?;
             Frame::Simple("OK".into())
         }
         Command::Del(del) => {
-            db.del(del.key()).await?;
+            db.del(Bytes::copy_from_slice(del.key().as_bytes()))?;
             Frame::Integer(1)
         }
     })

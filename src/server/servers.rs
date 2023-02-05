@@ -1,16 +1,17 @@
 use tokio::net::{TcpListener, ToSocketAddrs};
 
 use super::{connection::Connection, handler::Handler, Result};
-use crate::engine::Engine;
+use crate::leveldb::DB;
+use std::sync::Arc;
 
 pub struct Server {
-    engine: Engine,
+    db: DB,
 }
 
 impl Server {
     // Create a new Server with given engine
-    pub fn new(engine: Engine) -> Self {
-        Server { engine }
+    pub fn new(db: DB) -> Self {
+        Server { db }
     }
 
     // Run the server
@@ -21,7 +22,7 @@ impl Server {
             // Accept a new stream and construct a new task to run concurrently
             let (stream, _) = listener.accept().await?;
             let conn = Connection::new(stream);
-            let db = self.engine.clone();
+            let db = self.db.clone();
             let mut handler = Handler::new(db, conn);
 
             tokio::spawn(async move {

@@ -1,5 +1,7 @@
-use super::manifest::{CompactTask, Manifest, SSTableEntry};
-use super::sstable::{SSTable, SSTableBuilder, SSTableStream};
+use std::sync::Arc;
+
+use super::manifest::{CompactTask, Manifest};
+use super::sstable::{self, SSTableBuilder, SSTableStream};
 use super::util::Value;
 use super::Result;
 use bytes::Bytes;
@@ -21,15 +23,15 @@ impl Compactor {
         let compact_size = self.task.compact_size();
         let erase_tombstone = self.task.need_erase_tombstone();
         let target_lv = self.task.target_lv();
-        let mut new_entry: Option<(SSTableEntry, SSTableBuilder<File>)> = None;
+        let mut new_builder: Option<SSTableBuilder<File>> = None;
         let mut sstable_iter = self.open_all_sstable().await?;
 
         while let Some(element) = sstable_iter.next().await {
-            if new_entry.is_none() {
+            if new_builder.is_none() {
                 // Start a new builder
                 let entry = self.manifest.alloc_new_sstable_entry(target_lv);
-                let builder = SSTableBuilder::new(entry.open_writer().await?);
-                new_entry = Some((entry, builder));
+                let builder = entry.open_builder().await?;
+                new_builder = Some(builder);
             }
 
             let (key, value) = element?;
@@ -39,19 +41,18 @@ impl Compactor {
                 continue;
             }
 
-            let size = new_entry.as_mut().unwrap().1.add(key, value).await?;
+            let size = new_builder.as_mut().unwrap().add(key, value).await?;
             if size >= compact_size {
                 // Finish one compaction
-                let range = new_entry.as_mut().unwrap().1.finish().await?;
-                new_entry.as_mut().unwrap().0.set_range(range);
-                self.task.add_compact_result(new_entry.take().unwrap().0);
+                let new_entry = new_builder.take().unwrap().finish().await?;
+                self.task.add_compact_result(new_entry);
             }
         }
 
         // Finish remaining compaction
-        if let Some(mut entry) = new_entry {
-            entry.0.set_range(entry.1.finish().await?);
-            self.task.add_compact_result(entry.0);
+        if let Some(builder) = new_builder {
+            let new_entry = builder.finish().await?;
+            self.task.add_compact_result(new_entry);
         }
 
         // Finish all compaction
@@ -61,10 +62,12 @@ impl Compactor {
     // Open all sstable for compact operation
     async fn open_all_sstable(&self) -> Result<SSTablesIter<tokio::fs::File>> {
         let mut sstables = Vec::with_capacity(self.task.tables().size_hint().0);
-        for table in self.task.tables() {
-            let s = SSTable::open(table.open_reader().await?)
+        for entry in self.task.tables() {
+            // Open a new stream for this entry
+            let s = sstable::open(Arc::clone(entry))
                 .await?
-                .into_stream();
+                .open_stream()
+                .await?;
             sstables.push(s);
         }
         let table_count = sstables.len();
@@ -77,7 +80,7 @@ impl Compactor {
 }
 
 // SSTables iteration util struct, iterating sstables by merge-sort algorithm
-struct SSTablesIter<R> {
+struct SSTablesIter<R: AsyncRead + AsyncSeek + Unpin> {
     iters: Vec<SSTableStream<R>>,
     kvs: Vec<Option<(Bytes, Value)>>,
 }

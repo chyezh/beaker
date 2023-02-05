@@ -15,7 +15,7 @@ pub enum Error {
     #[error("db")]
     Db {
         #[from]
-        source: crate::engine::Error,
+        source: crate::leveldb::Error,
     },
 
     #[error("cmd")]
