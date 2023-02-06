@@ -19,6 +19,7 @@ use tracing::{info, warn};
 
 static EVENT_ID_ALLOC: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug)]
 pub enum Event {
     // Dump a memtable into sstable
     // Trigger
@@ -42,6 +43,7 @@ pub enum Event {
 }
 
 pub struct Config {
+    pub enable_timer: bool,
     pub inactive_reader_clean_period: Interval,
     pub inactive_log_clean_period: Interval,
     pub inactive_sstable_clean_period: Interval,
@@ -51,6 +53,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            enable_timer: true,
             inactive_reader_clean_period: interval(Duration::from_secs(60)),
             inactive_log_clean_period: interval(Duration::from_secs(500)),
             inactive_sstable_clean_period: interval(Duration::from_secs(500)),
@@ -110,30 +113,33 @@ impl EventLoopBuilder {
         // Start timer
         let mut shutdown = self.shutdown.take().unwrap();
         let mut timer_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Err(err) = tokio::select! {
-                    _ = timer_shutdown.listen() => {
-                        // Receive shutdown signal, stop timer
-                        break;
+
+        if config.enable_timer {
+            tokio::spawn(async move {
+                loop {
+                    if let Err(err) = tokio::select! {
+                        _ = timer_shutdown.listen() => {
+                            // Receive shutdown signal, stop timer
+                            break;
+                        }
+                        _ = config.inactive_reader_clean_period.tick() => {
+                            tx.send(Event::InactiveReaderClean)
+                        }
+                        _ = config.inactive_log_clean_period.tick() => {
+                            tx.send(Event::InactiveLogClean)
+                        }
+                        _ = config.inactive_sstable_clean_period.tick() => {
+                            tx.send(Event::InactiveSSTableClean)
+                        }
+                        _ = config.compact_period.tick() => {
+                            tx.send(Event::Compact)
+                        }
+                    } {
+                        warn!(error = err.to_string(), "send event from timer failed");
                     }
-                    _ = config.inactive_reader_clean_period.tick() => {
-                        tx.send(Event::InactiveReaderClean)
-                    }
-                    _ = config.inactive_log_clean_period.tick() => {
-                        tx.send(Event::InactiveLogClean)
-                    }
-                    _ = config.inactive_sstable_clean_period.tick() => {
-                        tx.send(Event::InactiveSSTableClean)
-                    }
-                    _ = config.compact_period.tick() => {
-                        tx.send(Event::Compact)
-                    }
-                } {
-                    warn!(error = err.to_string(), "send event from timer failed");
                 }
-            }
-        });
+            });
+        }
 
         // Start background task
         tokio::spawn(async move {
@@ -248,19 +254,23 @@ impl EventHandler {
         if let Err(err) = memtable
             .dump_oldest_immutable(|tables: Vec<Arc<KVTable>>| {
                 Box::pin(async move {
-                    // Build a new sstable from memtable if memtable is not empty
-                    let entry = manifest.alloc_new_sstable_entry(0);
-                    let mut builder = entry.open_builder().await?;
+                    for table in tables.iter() {
+                        if table.len() == 0 {
+                            continue;
+                        }
 
-                    for table in tables.iter().rev() {
+                        // Build a new sstable from memtable if memtable is not empty
+                        let entry = manifest.alloc_new_sstable_entry(0);
+                        let mut builder = entry.open_builder().await?;
+
                         for (key, value) in table.iter() {
                             builder.add(key.clone(), value.clone()).await?;
                         }
+                        let entry = builder.finish().await?;
+                        // Register the new sstable into manifest
+                        manifest.add_new_sstable(entry)?;
                     }
-                    let entry = builder.finish().await?;
 
-                    // Register the new sstable into manifest
-                    manifest.add_new_sstable(entry)?;
                     Ok(())
                 })
             })

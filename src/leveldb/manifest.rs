@@ -232,6 +232,11 @@ impl Manifest {
         })
     }
 
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.inner.read().version
+    }
+
     // Alloc a new sstable entry, and return its writer
     pub fn alloc_new_sstable_entry(&self, lv: usize) -> SSTableEntry {
         SSTableEntry::new(lv, sstable_root_path(&self.root_path))

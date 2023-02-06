@@ -57,7 +57,7 @@ impl MemTable {
                 let mut table = KVTable::new(*seq);
                 for data in reader {
                     let (key, value) = decode_kv(data?)?;
-                    table.entries.insert(key, value);
+                    table.set(key, value);
                 }
 
                 // Old tables never write new entry
@@ -97,15 +97,15 @@ impl MemTable {
     // Get the value by key
     pub fn get(&self, key: &[u8]) -> Option<Value> {
         // Read mutable first
-        if let Some(value) = self.mutable.lock().entries.get(key) {
-            return Some(value.clone());
+        if let Some(value) = self.mutable.lock().get(key) {
+            return Some(value);
         }
 
         // Read from immutable list
         let immutable = self.immutable.read();
         for table in immutable.iter().rev() {
-            if let Some(value) = table.entries.get(key) {
-                return Some(value.clone());
+            if let Some(value) = table.get(key) {
+                return Some(value);
             }
         }
         None
@@ -125,7 +125,7 @@ impl MemTable {
             .append(encode_kv(&key, &value))?;
 
         // Set value into in-memory table
-        mutable.entries.insert(key, value);
+        mutable.set(key, value);
 
         // Switch new log if needed
         // Low-rate route
@@ -304,6 +304,22 @@ impl KVTable {
     pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &Value)> {
         self.entries.iter()
     }
+
+    // Get length of inner list
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    // Set key value pair into table
+    fn set(&mut self, key: Bytes, value: Value) {
+        self.entries.insert(key, value);
+    }
+
+    // Get value by given key
+    fn get(&self, key: &[u8]) -> Option<Value> {
+        self.entries.get(key).cloned()
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +330,33 @@ mod tests {
 
     use super::*;
     use crate::util::test_case::generate_random_bytes;
+
+    #[test]
+    fn test_kv_table_iter() {
+        let test_count = 10000;
+
+        let test_case_key = generate_random_bytes(test_count, 10000);
+        let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
+
+        let mut kv: Vec<_> = test_case_key
+            .into_iter()
+            .zip(test_case_value.into_iter().map(Value::Living))
+            .collect();
+        let mut table = KVTable::new(0);
+
+        for (key, value) in kv.iter() {
+            table.set(key.clone(), value.clone());
+        }
+
+        assert_eq!(table.entries.len(), kv.len());
+
+        kv.sort_by_key(|elem| elem.0.clone());
+
+        for ((k1, v1), (k2, v2)) in table.iter().zip(kv.iter()) {
+            assert_eq!(k1, k2);
+            assert_eq!(v1, v2);
+        }
+    }
 
     #[test]
     fn test_log_with_random_case() {

@@ -16,3 +16,6 @@ Cargo.lock
 
 # Added by vscode
 .vscode
+
+# Added by test
+/data

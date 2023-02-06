@@ -67,7 +67,6 @@ pub fn from_le_bytes_32(data: &[u8]) -> usize {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 pub mod test_case {
     use bytes::Bytes;
 
@@ -78,6 +77,15 @@ pub mod test_case {
         }
         v
     }
+
+    pub fn sequence_number_kv_iter(max: usize) -> impl Iterator<Item = (Bytes, Bytes)> {
+        sequence_number_iter(max).zip(sequence_number_iter(max))
+    }
+
+    pub fn reverse_sequence_number_kv_iter(max: usize) -> impl Iterator<Item = (Bytes, Bytes)> {
+        sequence_number_iter(max).zip(reverse_sequence_number_iter(max))
+    }
+
     pub fn sequence_number_iter(max: usize) -> impl Iterator<Item = Bytes> {
         (0..max).map(|i| Bytes::from(i.to_string()))
     }

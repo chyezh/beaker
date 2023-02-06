@@ -92,13 +92,26 @@ impl DB {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
-    use crate::util::test_case::{
-        generate_random_bytes, reverse_sequence_number_iter, sequence_number_iter,
+    use crate::util::{
+        shutdown::Notifier,
+        test_case::{reverse_sequence_number_kv_iter, sequence_number_kv_iter},
+    };
+    use crate::{
+        leveldb::event::Event,
+        util::{
+            shutdown,
+            test_case::{
+                generate_random_bytes, reverse_sequence_number_iter, sequence_number_iter,
+            },
+        },
     };
     use rand::{self, Rng};
-    use tokio::test;
+    use tokio::{
+        sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        test,
+    };
+    use tracing::log::info;
 
     #[test]
     async fn test_db_with_random_case() {
@@ -137,6 +150,152 @@ mod tests {
         for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
         {
             assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
+        }
+    }
+
+    #[test(flavor = "multi_thread", worker_threads = 3)]
+    async fn test_db_with_dump_and_clean_task() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        info!("start testing");
+        let test_count = 100000;
+        let root_path = "./data";
+
+        info!("Test set/get key-value into memtable");
+        {
+            let (db, _event_sender, _rx) = create_background_full_control_db(root_path);
+
+            // Set DB
+            for (k, v) in sequence_number_kv_iter(test_count) {
+                db.set(k, v).unwrap();
+            }
+
+            // Get DB
+            for (k, v) in sequence_number_kv_iter(test_count) {
+                assert_eq!(db.get(&k).await.unwrap(), Some(v));
+            }
+
+            db.shutdown().await
+        }
+
+        info!("Test memtable recovery and overwrite");
+        {
+            let (db, _event_sender, _rx) = create_background_full_control_db(root_path);
+
+            // Get DB
+            for (k, v) in sequence_number_kv_iter(test_count) {
+                assert_eq!(db.get(&k).await.unwrap(), Some(v));
+            }
+
+            // Set DB
+            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
+                db.set(k, v).unwrap();
+            }
+
+            // Get DB
+            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
+                assert_eq!(db.get(&k).await.unwrap(), Some(v));
+            }
+
+            db.shutdown().await;
+        }
+
+        info!("Test memtable recovery again");
+        {
+            let (db, _event_sender, _rx) = create_background_full_control_db(root_path);
+
+            // Get DB
+            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
+                assert_eq!(db.get(&k).await.unwrap(), Some(v));
+            }
+
+            db.shutdown().await;
+        }
+
+        info!("Test get when dump");
+        {
+            let (db, event_sender, _rx) = create_background_full_control_db(root_path);
+            // Trigger a dump operation
+            event_sender.send(Event::Dump).unwrap();
+
+            let version = db.manifest.version();
+            loop {
+                // Test util dump finished
+                for (k, v) in reverse_sequence_number_kv_iter(test_count) {
+                    assert_eq!(db.get(&k).await.unwrap(), Some(v));
+                }
+
+                if db.manifest.version() > version {
+                    break;
+                }
+            }
+
+            // Test after dump finished
+            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
+                assert_eq!(db.get(&k).await.unwrap(), Some(v));
+            }
+
+            db.shutdown().await;
+        }
+
+        info!("Test recovery after dump");
+        {
+            let (db, event_sender, _rx) = create_background_full_control_db(root_path);
+
+            // Test util dump finished
+            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
+                assert_eq!(db.get(&k).await.unwrap(), Some(v));
+            }
+
+            // Clean the memtable log, no effect
+            event_sender.send(Event::InactiveLogClean).unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            db.shutdown().await;
+        }
+
+        info!("Test dump again");
+        {
+            let (db, event_sender, _rx) = create_background_full_control_db(root_path);
+
+            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
+                assert_eq!(db.get(&k).await.unwrap(), Some(v));
+            }
+            // Trigger a dump operation
+            event_sender.send(Event::Dump).unwrap();
+
+            let version = db.manifest.version();
+            loop {
+                // Test util dump finished
+                for (k, v) in reverse_sequence_number_kv_iter(test_count) {
+                    assert_eq!(db.get(&k).await.unwrap(), Some(v));
+                }
+
+                if db.manifest.version() > version {
+                    break;
+                }
+            }
+
+            // Test after dump finished
+            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
+                assert_eq!(db.get(&k).await.unwrap(), Some(v));
+            }
+
+            // Clean the memtable log, no effect
+            event_sender.send(Event::InactiveLogClean).unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            db.shutdown().await;
+        }
+
+        info!("Test get after dump and clean log");
+        {
+            let (db, event_sender, _rx) = create_background_full_control_db(root_path);
+
+            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
+                assert_eq!(db.get(&k).await.unwrap(), Some(v));
+            }
+
+            db.shutdown().await;
         }
     }
 
@@ -195,5 +354,33 @@ mod tests {
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    }
+
+    fn create_background_full_control_db(
+        path: impl Into<PathBuf> + Copy,
+    ) -> (DB, UnboundedSender<Event>, UnboundedReceiver<Event>) {
+        let shutdown = Notifier::new();
+        let (fake_event_sender, _rx) = unbounded_channel();
+        let (event_sender, mut event_builder) = EventLoopBuilder::new();
+
+        let manifest = Manifest::open(path, fake_event_sender.clone()).unwrap();
+        let memtable = MemTable::open(path, fake_event_sender).unwrap();
+
+        // Start a background task
+        let mut config = Config::default();
+        config.enable_timer = false;
+        event_builder
+            .manifest(manifest.clone())
+            .memtable(memtable.clone())
+            .shutdown(shutdown.listen().unwrap());
+        event_builder.run(config);
+
+        let db = DB {
+            manifest,
+            memtable,
+            shutdown: Arc::new(Mutex::new(Some(shutdown))),
+        };
+
+        (db, event_sender, _rx)
     }
 }
