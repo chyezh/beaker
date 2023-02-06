@@ -620,12 +620,12 @@ fn merge_tables(
 }
 
 #[inline]
-fn sstable_root_path(path: &PathBuf) -> PathBuf {
+fn sstable_root_path(path: &Path) -> PathBuf {
     path.join("tables")
 }
 
 #[inline]
-fn manifest_root_path(path: &PathBuf) -> PathBuf {
+fn manifest_root_path(path: &Path) -> PathBuf {
     path.join("manifest")
 }
 
@@ -636,7 +636,7 @@ fn open_new_manifest(dir: &Path, seq: u64) -> Result<File> {
         .truncate(true)
         .create(true)
         .write(true)
-        .open(&path)?;
+        .open(path)?;
 
     Ok(new_file)
 }

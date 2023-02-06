@@ -54,7 +54,7 @@ impl MemTable {
             // Recover immutable memtable
             for (path, seq) in log_files.iter() {
                 let reader = RecordReader::new(File::open(path.as_path())?);
-                let mut table = KVTable::new(*seq, path.clone());
+                let mut table = KVTable::new(*seq);
                 for data in reader {
                     let (key, value) = decode_kv(data?)?;
                     table.entries.insert(key, value);
@@ -71,8 +71,8 @@ impl MemTable {
 
         // Create new mutable to write
         let new_log_seq = next_log_seq;
-        let (new_file, new_log_path) = open_new_log(&root_path, new_log_seq)?;
-        let mut mutable = KVTable::new(new_log_seq, new_log_path);
+        let (new_file, _) = open_new_log(&root_path, new_log_seq)?;
+        let mut mutable = KVTable::new(new_log_seq);
         mutable.log = Some(RecordWriter::new(new_file));
         next_log_seq += 1;
 
@@ -133,8 +133,8 @@ impl MemTable {
             let new_log_seq = self.next_log_seq.fetch_add(1, Ordering::Relaxed);
 
             // Create a new writer
-            let (new_file, new_log_path) = open_new_log(&self.root_path, new_log_seq)?;
-            let mut new_mutable = KVTable::new(new_log_seq, new_log_path);
+            let (new_file, _) = open_new_log(&self.root_path, new_log_seq)?;
+            let mut new_mutable = KVTable::new(new_log_seq);
             new_mutable.log = Some(RecordWriter::new(new_file));
 
             // Swap mutable, close writer, and convert old mutable into immutable
@@ -286,30 +286,17 @@ fn open_new_log(dir: &Path, log_seq: u64) -> Result<(File, PathBuf)> {
 pub struct KVTable {
     entries: BTreeMap<Bytes, Value>,
     log: Option<RecordWriter<File>>,
-    path: PathBuf,
     seq: u64,
 }
 
 impl KVTable {
     // Create a new memtable
-    fn new(seq: u64, path: PathBuf) -> KVTable {
+    fn new(seq: u64) -> KVTable {
         KVTable {
             entries: BTreeMap::default(),
             log: None,
-            path,
             seq,
         }
-    }
-
-    // Get length of inner entries
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[inline]
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     // Get iterator of the table
@@ -334,13 +321,13 @@ mod tests {
 
         let test_case_key = generate_random_bytes(test_count, 10000);
         let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
-        let (tx, rx) = unbounded_channel();
+        let (tx, _rx) = unbounded_channel();
 
         // Test normal value
         let memtable = MemTable::open("./data", tx.clone()).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             memtable
-                .set(key.clone(), Value::living(value.clone()))
+                .set(key.clone(), Value::Living(value.clone()))
                 .unwrap();
         }
 
@@ -386,13 +373,13 @@ mod tests {
         {
             if is_deleted.first().unwrap() % 2 == 0 {
                 memtable
-                    .set(key.clone(), Value::living(value.clone()))
+                    .set(key.clone(), Value::Living(value.clone()))
                     .unwrap();
             }
         }
 
         drop(memtable);
-        let memtable = MemTable::open("./data", tx.clone()).unwrap();
+        let memtable = MemTable::open("./data", tx).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             if let Some(Value::Living(v)) = memtable.get(key) {
                 assert_eq!(value, &v);

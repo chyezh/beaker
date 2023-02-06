@@ -18,25 +18,10 @@ pub enum Value {
 }
 
 impl Value {
-    pub fn living_static(data: &'static [u8]) -> Self {
-        Value::Living(Bytes::from_static(data))
-    }
-
-    pub fn living_raw(data: &[u8]) -> Self {
-        Value::Living(Bytes::copy_from_slice(data))
-    }
-
-    pub fn living(data: Bytes) -> Self {
-        Value::Living(data)
-    }
-
-    pub fn tombstone() -> Self {
-        Value::Tombstone
-    }
-
+    #[inline]
     pub fn to_bytes(&self) -> Bytes {
         let mut v = Vec::with_capacity(self.encode_bytes_len());
-        self.encode_to(&mut v);
+        self.encode_to(&mut v).ok();
         v.into()
     }
 
@@ -123,7 +108,7 @@ pub async fn async_scan_file_at_path(path: &Path, extension: &str) -> Result<Vec
             continue;
         }
 
-        if let Some((Ok(seq))) = filepath
+        if let Some(Ok(seq)) = filepath
             .file_stem()
             .and_then(std::ffi::OsStr::to_str)
             .map(str::parse::<u64>)

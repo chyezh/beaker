@@ -571,7 +571,6 @@ impl Index {
 pub struct SSTableManager<R: AsyncRead + AsyncSeek + Unpin> {
     readers: Arc<RwLock<HashMap<Uuid, Arc<SSTable<R>>>>>,
     active_entry_uid: Arc<parking_lot::Mutex<HashSet<Uuid>>>,
-    instant_reference: Instant,
 }
 
 impl SSTableManager<File> {
@@ -632,7 +631,6 @@ impl SSTableManager<File> {
         SSTableManager {
             readers: Arc::new(RwLock::new(HashMap::new())),
             active_entry_uid: Arc::new(parking_lot::Mutex::new(HashSet::new())),
-            instant_reference: Instant::now(),
         }
     }
 
@@ -775,12 +773,12 @@ mod tests {
         test_case_key.sort();
         std::fs::create_dir_all("./data").unwrap();
 
-        let mut uid: Option<Uuid> = None;
+        let uid: Uuid;
         {
             let entry = SSTableEntry::new(0, "./data".into());
-            uid = Some(entry.uid);
+            uid = entry.uid;
             // Check MANAGER
-            assert!(is_active_uuid(&uid.unwrap()));
+            assert!(is_active_uuid(&uid));
             // Test build
             let mut builder = entry.open_builder().await.unwrap();
             for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
@@ -808,7 +806,7 @@ mod tests {
             while let Some(item) = s.next().await {
                 let (key, value) = item.unwrap();
                 assert_eq!(key, test_case_key[offset]);
-                assert_eq!(value, Value::living(test_case_value[offset].clone()));
+                assert_eq!(value, Value::Living(test_case_value[offset].clone()));
                 offset += 1;
             }
 
@@ -817,6 +815,6 @@ mod tests {
         }
 
         // Check MANAGER
-        assert!(!is_active_uuid(&uid.unwrap()));
+        assert!(!is_active_uuid(&uid));
     }
 }

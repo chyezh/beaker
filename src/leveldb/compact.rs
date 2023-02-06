@@ -147,3 +147,6 @@ impl<R: AsyncRead + AsyncSeek + Unpin> SSTablesIter<R> {
         self.take_min_kv().await.map(Ok)
     }
 }
+
+#[cfg(test)]
+mod tests {}

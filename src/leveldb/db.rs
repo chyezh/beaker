@@ -141,18 +141,6 @@ mod tests {
     }
 
     #[test(flavor = "multi_thread", worker_threads = 3)]
-    async fn test_db_with_sequence_numbe2r2() {
-        // Reopen db and test get
-        let db = DB::open("./data").unwrap();
-        let test_count = 10000000;
-
-        //for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
-        //{
-        //    assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
-        //}
-    }
-
-    #[test(flavor = "multi_thread", worker_threads = 3)]
     async fn test_db_with_sequence_number() {
         let _ = env_logger::builder().is_test(true).try_init();
         tracing::info!("start testing");
