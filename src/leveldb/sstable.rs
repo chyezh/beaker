@@ -41,8 +41,8 @@ pub async fn open(entry: Arc<SSTableEntry>) -> Result<Arc<SSTable<File>>> {
     MANAGER.open(entry).await
 }
 
-pub fn clear_inactive_readers(secs: u64) {
-    MANAGER.clear_inactive_readers(secs);
+pub fn clean_inactive_readers(secs: u64) {
+    MANAGER.clean_inactive_readers(secs);
 }
 
 pub fn is_active_uuid(uid: &Uuid) -> bool {
@@ -256,7 +256,6 @@ impl SSTableEntry {
 
 impl Drop for SSTableEntry {
     fn drop(&mut self) {
-        println!("drop entry");
         MANAGER.drop_entry(&self.uid);
     }
 }
@@ -603,7 +602,7 @@ impl SSTableManager<File> {
     }
 
     // Clear all inactive readers
-    pub fn clear_inactive_readers(&self, secs: u64) {
+    pub fn clean_inactive_readers(&self, secs: u64) {
         // Pre-find all inactive reader, avoid acquire write lock
         let mut uid_list = Vec::new();
         {
@@ -814,7 +813,7 @@ mod tests {
             }
 
             // Drop all access entry
-            clear_inactive_readers(0);
+            clean_inactive_readers(0);
         }
 
         // Check MANAGER

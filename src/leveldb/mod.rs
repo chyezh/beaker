@@ -1,5 +1,6 @@
 mod block;
 mod compact;
+mod event;
 mod manifest;
 mod memtable;
 mod record;

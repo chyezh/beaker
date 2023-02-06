@@ -1,3 +1,4 @@
+use super::event::Event;
 use super::record::RecordWriter;
 use super::sstable::{self, SSTableEntry};
 use super::util::scan_sorted_file_at_path;
@@ -12,13 +13,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-const SSTABLE_FILE_EXTENSION: &str = "tbl";
 const MANIFEST_FILE_EXTENSION: &str = "manifest";
-const MINIMUM_SSTABLE_ENTRY_SIZE: usize = 28;
 const MINIMUM_MANIFEST_INNER_SIZE: usize = 8;
 const SPLIT_MANIFEST_SIZE_THRESHOLD: usize = 32 * 1024 * 1024; // 32MB
 
@@ -173,15 +172,15 @@ pub struct Manifest {
     inner: Arc<RwLock<ManifestInner>>,
     persister: Arc<Mutex<ManifestPersister>>,
     root_path: PathBuf,
-    compact_tx: UnboundedSender<()>,
-    clean_sstable_tx: UnboundedSender<()>,
+    event_sender: UnboundedSender<Event>,
 }
 
 impl Manifest {
     // Open a new manifest record
     pub fn open(
         root_path: impl Into<PathBuf>,
-    ) -> Result<(Self, UnboundedReceiver<()>, UnboundedReceiver<()>)> {
+        event_sender: UnboundedSender<Event>,
+    ) -> Result<Self> {
         // Try to create manifest root directory
         let root_path: PathBuf = root_path.into();
         fs::create_dir_all(sstable_root_path(&root_path))?;
@@ -218,26 +217,19 @@ impl Manifest {
             // Empty manifest root path, create new empty manifest
             (ManifestInner::default(), 0)
         };
+
         // Open new persister
         let mut persister = ManifestPersister::open(manifest_root_path(&root_path), next_log_seq)?;
-        let (compact_tx, compact_rx) = unbounded_channel();
-        let (clean_sstable_tx, clean_sstable_rx) = unbounded_channel();
-
         // Persist manifest to the newest log and clear old manifest log
         persister.persist(&inner)?;
         persister.clear_old_manifest();
 
-        Ok((
-            Manifest {
-                inner: Arc::new(RwLock::new(inner)),
-                root_path,
-                persister: Arc::new(Mutex::new(persister)),
-                compact_tx,
-                clean_sstable_tx,
-            },
-            compact_rx,
-            clean_sstable_rx,
-        ))
+        Ok(Manifest {
+            inner: Arc::new(RwLock::new(inner)),
+            root_path,
+            persister: Arc::new(Mutex::new(persister)),
+            event_sender,
+        })
     }
 
     // Alloc a new sstable entry, and return its writer
@@ -269,7 +261,7 @@ impl Manifest {
         *manifest = new_manifest;
 
         // Trigger to find new compact task
-        if let Err(err) = self.compact_tx.send(()) {
+        if let Err(err) = self.event_sender.send(Event::Compact) {
             info!(
                 error = err.to_string(),
                 "receiver for compact trigger has been released"
@@ -337,7 +329,7 @@ impl Manifest {
         *manifest = new_manifest;
 
         // Clear old files
-        if let Err(err) = self.clean_sstable_tx.send(()) {
+        if let Err(err) = self.event_sender.send(Event::InactiveSSTableClean) {
             info!(
                 error = err.to_string(),
                 "receiver for clean sstable trigger has been released"
@@ -345,7 +337,7 @@ impl Manifest {
         }
 
         // Trigger to find new compact task
-        if let Err(err) = self.compact_tx.send(()) {
+        if let Err(err) = self.event_sender.send(Event::Compact) {
             info!(
                 error = err.to_string(),
                 "receiver for compact trigger has been released"

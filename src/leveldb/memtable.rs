@@ -1,20 +1,24 @@
 use super::{
+    event::Event,
     record::{RecordReader, RecordWriter},
-    util::{scan_sorted_file_at_path, Value},
+    util::{async_scan_file_at_path, scan_sorted_file_at_path, Value},
     Error, Result,
 };
 use crate::util::from_le_bytes_32;
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
-use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use futures_core::Future;
+use parking_lot::{Mutex, RwLock};
 use std::{
     collections::BTreeMap,
-    sync::atomic::{AtomicU64, Ordering},
+    fs::{self, File, OpenOptions},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tracing::{debug, warn};
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::info;
 
 const KV_HEADER: usize = 8; // key_len + value_len 4+4
 const SPLIT_LOG_SIZE_THRESHOLD: usize = 4 * 1024 * 1024; // 4M
@@ -27,12 +31,15 @@ pub struct MemTable {
     immutable: Arc<RwLock<Vec<Arc<KVTable>>>>,
     root_path: PathBuf,
     next_log_seq: Arc<AtomicU64>,
-
-    dump_tx: UnboundedSender<DumpRequest>,
+    event_sender: UnboundedSender<Event>,
+    dump_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl MemTable {
-    pub fn open(root_path: impl Into<PathBuf>) -> Result<(Self, UnboundedReceiver<DumpRequest>)> {
+    pub fn open(
+        root_path: impl Into<PathBuf>,
+        event_sender: UnboundedSender<Event>,
+    ) -> Result<Self> {
         // Try to create log root directory at this path.
         let root_path: PathBuf = root_path.into();
         fs::create_dir_all(root_path.as_path())?;
@@ -40,18 +47,14 @@ impl MemTable {
         // Scan the root_path directory, find all log sorted by sequence number
         let log_files = scan_sorted_file_at_path(&root_path, LOG_FILE_EXTENSION)?;
 
-        // Create dump task channel
-        let (tx, rx) = mpsc::unbounded_channel::<DumpRequest>();
-        let (finish_tx, finish_rx) = mpsc::unbounded_channel::<PathBuf>();
-
         // Recover immutables
         let (immutable, mut next_log_seq) = if !log_files.is_empty() {
             let mut tables = Vec::with_capacity(log_files.len());
 
             // Recover immutable memtable
-            for (path, _) in log_files.iter() {
+            for (path, seq) in log_files.iter() {
                 let reader = RecordReader::new(File::open(path.as_path())?);
-                let mut table = KVTable::new(path.clone());
+                let mut table = KVTable::new(*seq, path.clone());
                 for data in reader {
                     let (key, value) = decode_kv(data?)?;
                     table.entries.insert(key, value);
@@ -60,9 +63,6 @@ impl MemTable {
                 // Old tables never write new entry
                 let immutable_table = Arc::new(table);
                 tables.push(Arc::clone(&immutable_table));
-                // Ask to dump the immutable memtable
-                let send_result = tx.send(DumpRequest::new(immutable_table));
-                debug_assert!(send_result.is_ok());
             }
             (tables, log_files.last().unwrap().1 + 1)
         } else {
@@ -72,19 +72,26 @@ impl MemTable {
         // Create new mutable to write
         let new_log_seq = next_log_seq;
         let (new_file, new_log_path) = open_new_log(&root_path, new_log_seq)?;
-        let mut mutable = KVTable::new(new_log_path);
+        let mut mutable = KVTable::new(new_log_seq, new_log_path);
         mutable.log = Some(RecordWriter::new(new_file));
         next_log_seq += 1;
+
+        // Try to dump old immutable memtable
+        if !immutable.is_empty() {
+            let send_result = event_sender.send(Event::Dump);
+            debug_assert!(send_result.is_ok());
+        }
 
         let table = MemTable {
             mutable: Arc::new(Mutex::new(mutable)),
             immutable: Arc::new(RwLock::new(immutable)),
             root_path,
             next_log_seq: Arc::new(AtomicU64::new(next_log_seq)),
-            dump_tx: tx,
+            event_sender,
+            dump_mutex: Arc::new(tokio::sync::Mutex::new(())),
         };
 
-        Ok((table, rx))
+        Ok(table)
     }
 
     // Get the value by key
@@ -96,7 +103,7 @@ impl MemTable {
 
         // Read from immutable list
         let immutable = self.immutable.read();
-        for table in &*immutable {
+        for table in immutable.iter().rev() {
             if let Some(value) = table.entries.get(key) {
                 return Some(value.clone());
             }
@@ -127,7 +134,7 @@ impl MemTable {
 
             // Create a new writer
             let (new_file, new_log_path) = open_new_log(&self.root_path, new_log_seq)?;
-            let mut new_mutable = KVTable::new(new_log_path);
+            let mut new_mutable = KVTable::new(new_log_seq, new_log_path);
             new_mutable.log = Some(RecordWriter::new(new_file));
 
             // Swap mutable, close writer, and convert old mutable into immutable
@@ -136,73 +143,84 @@ impl MemTable {
             new_mutable.log.take();
 
             let immutable = Arc::new(new_mutable);
-            // Release immutable first, read requests see new empty mutable after new immutable first.
+            // Release immutable first, read requests see new empty mutable after new immutable.
             // Previous write would not be lost on this read requests.
             self.immutable.write().push(Arc::clone(&immutable));
 
             // Send a dump request
             // Send operation would never fail
-            let result = self.dump_tx.send(DumpRequest::new(immutable));
+            let result = self.event_sender.send(Event::Dump);
             debug_assert!(result.is_ok());
         }
 
         Ok(())
     }
 
-    // Clean the immutable memtable and corresponding log
-    pub fn clean_immutable(&self, path: &Path) {
-        let immutable = Arc::clone(&self.immutable);
-        let mut path_check_pass = false;
-        {
-            // Clear memtable if path check pass
-            let mut tables = immutable.write();
-            if let Some(first_table) = tables.first() {
-                if path == first_table.path {
-                    // remove immutable memtable
-                    tables.remove(0);
-                    path_check_pass = true;
-                }
-            }
+    // Dump oldest immutable memtable and remove it
+    pub async fn dump_oldest_immutable<
+        C: FnOnce(Vec<Arc<KVTable>>) -> E,
+        E: Future<Output = Result<()>> + Send + 'static,
+    >(
+        &self,
+        f: C,
+    ) -> Result<()> {
+        // Acquire lock first
+        let _guard = self.dump_mutex.try_lock();
+        if _guard.is_err() {
+            return Ok(());
         }
+        let immutable = self.immutable.read().clone();
+        let immutable_len = immutable.len();
+        if immutable_len > 0 {
+            // Try to Dump all immutable
+            f(immutable).await?;
+            // Remove all dumped immutable if dump finish
+            let mut tables = self.immutable.write();
+            let mut new_tables = Vec::with_capacity((2 * (tables.len() - immutable_len)).max(5));
+            for table in &tables[immutable_len..] {
+                new_tables.push(Arc::clone(table));
+            }
+            *tables = new_tables;
 
-        // remove old log if path check pass
-        if path_check_pass {
-            if let Err(err) = fs::remove_file(path) {
-                warn!(
+            // Try to clear log
+            if let Err(err) = self.event_sender.send(Event::InactiveLogClean) {
+                info!(
                     error = err.to_string(),
-                    "remove expired memtable file failed"
+                    "receiver for inactive log clean trigger has been released"
                 );
             }
         }
-    }
-}
 
-// Ask to do a dump operation for a slice of memtable
-#[derive(Debug)]
-pub struct DumpRequest {
-    table: Arc<KVTable>,
-}
-
-impl DumpRequest {
-    #[inline]
-    fn new(table: Arc<KVTable>) -> Self {
-        DumpRequest { table }
+        Ok(())
     }
 
-    #[inline]
-    pub fn path(&self) -> &Path {
-        &self.table.path
-    }
+    // Clean the inactive memtable log
+    pub async fn clean_inactive_log(&self) -> Result<()> {
+        let filenames = async_scan_file_at_path(&self.root_path, LOG_FILE_EXTENSION).await?;
 
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.table.entries.len()
-    }
+        // at least one mutable memtable
+        if filenames.len() <= 1 {
+            return Ok(());
+        }
 
-    // Get iterator of the table
-    #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &Value)> {
-        self.table.entries.iter()
+        // Get minimal immutable seq id
+        // It's safe to get mutable seq first, seq is monotonic.
+        let mut minimal_seq = self.mutable.lock().seq;
+        {
+            // It's safe to clean all log except mutable if immutable is empty
+            if let Some(table) = self.immutable.read().first() {
+                minimal_seq = table.seq;
+            }
+        }
+
+        // Clear log which sequence is less than minimal seq
+        for (filename, seq) in filenames {
+            if seq < minimal_seq {
+                tokio::fs::remove_file(filename).await?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -265,26 +283,47 @@ fn open_new_log(dir: &Path, log_seq: u64) -> Result<(File, PathBuf)> {
 // Implement kv table
 // TODO: replace by skip list in future
 #[derive(Debug)]
-struct KVTable {
+pub struct KVTable {
     entries: BTreeMap<Bytes, Value>,
     log: Option<RecordWriter<File>>,
     path: PathBuf,
+    seq: u64,
 }
 
 impl KVTable {
     // Create a new memtable
-    fn new(path: PathBuf) -> KVTable {
+    fn new(seq: u64, path: PathBuf) -> KVTable {
         KVTable {
             entries: BTreeMap::default(),
             log: None,
             path,
+            seq,
         }
+    }
+
+    // Get length of inner entries
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[inline]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    // Get iterator of the table
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &Value)> {
+        self.entries.iter()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use core::panic;
+
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::util::test_case::generate_random_bytes;
@@ -295,9 +334,10 @@ mod tests {
 
         let test_case_key = generate_random_bytes(test_count, 10000);
         let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
+        let (tx, rx) = unbounded_channel();
 
         // Test normal value
-        let (memtable, _) = MemTable::open("./data").unwrap();
+        let memtable = MemTable::open("./data", tx.clone()).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             memtable
                 .set(key.clone(), Value::living(value.clone()))
@@ -305,7 +345,7 @@ mod tests {
         }
 
         drop(memtable);
-        let (memtable, _) = MemTable::open("./data").unwrap();
+        let memtable = MemTable::open("./data", tx.clone()).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             if let Some(Value::Living(v)) = memtable.get(key) {
                 assert_eq!(value, &v);
@@ -323,7 +363,7 @@ mod tests {
         }
 
         drop(memtable);
-        let (memtable, _) = MemTable::open("./data").unwrap();
+        let memtable = MemTable::open("./data", tx.clone()).unwrap();
         for ((key, value), is_deleted) in test_case_key
             .iter()
             .zip(test_case_value.iter())
@@ -352,7 +392,7 @@ mod tests {
         }
 
         drop(memtable);
-        let (memtable, _) = MemTable::open("./data").unwrap();
+        let memtable = MemTable::open("./data", tx.clone()).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             if let Some(Value::Living(v)) = memtable.get(key) {
                 assert_eq!(value, &v);

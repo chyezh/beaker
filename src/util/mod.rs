@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use crc::{Crc, CRC_32_ISCSI};
 use std::io::{Read, Seek, SeekFrom};
 

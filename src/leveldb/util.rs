@@ -110,3 +110,27 @@ pub fn scan_sorted_file_at_path(path: &Path, extension: &str) -> Result<Vec<(Pat
     filenames.sort_by_key(|elem| elem.1);
     Ok(filenames)
 }
+
+// Scan given directory and get all file with given extension
+pub async fn async_scan_file_at_path(path: &Path, extension: &str) -> Result<Vec<(PathBuf, u64)>> {
+    let mut filenames: Vec<(PathBuf, u64)> = Vec::with_capacity(32);
+
+    let mut reader = tokio::fs::read_dir(&path).await?;
+    while let Ok(Some(entry)) = reader.next_entry().await {
+        // Parse sequence id from filename
+        let filepath = entry.path();
+        if !filepath.is_file() || filepath.extension() != Some(extension.as_ref()) {
+            continue;
+        }
+
+        if let Some((Ok(seq))) = filepath
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(str::parse::<u64>)
+        {
+            filenames.push((filepath, seq));
+        }
+    }
+
+    Ok(filenames)
+}
