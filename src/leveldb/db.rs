@@ -92,122 +92,52 @@ impl DB {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::util::{
-        shutdown::Notifier,
-        test_case::{reverse_sequence_number_kv_iter, sequence_number_kv_iter},
-    };
+    use super::{super::event::Event, *};
     use crate::{
-        leveldb::event::Event,
-        util::{
-            shutdown,
-            test_case::{
-                generate_random_bytes, reverse_sequence_number_iter, sequence_number_iter,
-            },
-        },
+        leveldb::event::{EventMessage, EventNotifier},
+        util::shutdown::Notifier,
     };
-    use rand::{self, Rng};
     use tokio::{
-        sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        sync::mpsc::{unbounded_channel, UnboundedReceiver},
         test,
     };
     use tracing::log::info;
 
-    #[test]
-    async fn test_db_with_random_case() {
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        let test_count = 1000;
-        let test_case_key = generate_random_bytes(test_count, 10000);
-        let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
-
-        let db = DB::open("./data").unwrap();
-        for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            db.set(key.clone(), value.clone()).unwrap();
-        }
-
-        for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
-            assert_eq!(db.get(key).await.unwrap().unwrap(), value.clone());
-        }
-        db.shutdown().await;
-    }
-
-    #[test]
-    async fn test_get_db_with_sequence_number() {
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        let test_count = 1000000;
-        let db = DB::open("./data").unwrap();
-        // Get db
-        for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
-        {
-            assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
-        }
-
-        // Reopen db and test get
-        db.shutdown().await;
-        let db = DB::open("./data").unwrap();
-        for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
-        {
-            assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
-        }
-    }
-
     #[test(flavor = "multi_thread", worker_threads = 3)]
-    async fn test_db_with_dump_and_clean_task() {
+    async fn test_dump_and_log_clean_with_sequence_case() {
         let _ = env_logger::builder().is_test(true).try_init();
-        info!("start testing");
-        let test_count = 100000;
+        let min = 0;
+        let max = 100000;
         let root_path = "./data";
 
+        let case = TestCase::build_sequence_and_reverse_case(min, max);
+
+        test_dump_and_log_clean(&case, root_path).await;
+    }
+
+    async fn test_dump_and_log_clean(case: &TestCase, root_path: &str) {
         info!("Test set/get key-value into memtable");
         {
             let (db, _event_sender, _rx) = create_background_full_control_db(root_path);
-
-            // Set DB
-            for (k, v) in sequence_number_kv_iter(test_count) {
-                db.set(k, v).unwrap();
-            }
-
-            // Get DB
-            for (k, v) in sequence_number_kv_iter(test_count) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v));
-            }
-
+            case.test_set(&db, 0);
+            case.test_get(&db, 0).await;
             db.shutdown().await
         }
 
         info!("Test memtable recovery and overwrite");
         {
             let (db, _event_sender, _rx) = create_background_full_control_db(root_path);
-
-            // Get DB
-            for (k, v) in sequence_number_kv_iter(test_count) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v));
-            }
-
-            // Set DB
-            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
-                db.set(k, v).unwrap();
-            }
-
-            // Get DB
-            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v));
-            }
-
+            case.test_get(&db, 0).await;
+            // Overwrite with new value
+            case.test_set(&db, 1);
+            case.test_get(&db, 1).await;
             db.shutdown().await;
         }
 
         info!("Test memtable recovery again");
         {
             let (db, _event_sender, _rx) = create_background_full_control_db(root_path);
-
-            // Get DB
-            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v));
-            }
-
+            case.test_get(&db, 1).await;
             db.shutdown().await;
         }
 
@@ -215,160 +145,112 @@ mod tests {
         {
             let (db, event_sender, _rx) = create_background_full_control_db(root_path);
             // Trigger a dump operation
-            event_sender.send(Event::Dump).unwrap();
-
-            let version = db.manifest.version();
+            let mut done = event_sender.notify(Event::Dump).unwrap();
+            // Test util dump finished
             loop {
-                // Test util dump finished
-                for (k, v) in reverse_sequence_number_kv_iter(test_count) {
-                    assert_eq!(db.get(&k).await.unwrap(), Some(v));
-                }
-
-                if db.manifest.version() > version {
+                case.test_get(&db, 1).await;
+                if done.is_done() {
                     break;
                 }
             }
-
             // Test after dump finished
-            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v));
-            }
-
+            case.test_get(&db, 1).await;
             db.shutdown().await;
         }
 
         info!("Test recovery after dump");
         {
             let (db, event_sender, _rx) = create_background_full_control_db(root_path);
-
-            // Test util dump finished
-            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v));
-            }
-
+            case.test_get(&db, 1).await;
             // Clean the memtable log, no effect
-            event_sender.send(Event::InactiveLogClean).unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
+            event_sender
+                .notify(Event::InactiveLogClean)
+                .unwrap()
+                .done()
+                .await;
             db.shutdown().await;
         }
 
         info!("Test dump again");
         {
             let (db, event_sender, _rx) = create_background_full_control_db(root_path);
-
-            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v));
-            }
-            // Trigger a dump operation
-            event_sender.send(Event::Dump).unwrap();
-
-            let version = db.manifest.version();
+            case.test_get(&db, 1).await;
+            // Trigger a dump operation and clean log operation
+            let mut done = event_sender.notify(Event::Dump).unwrap();
+            event_sender.notify(Event::InactiveLogClean).unwrap();
             loop {
                 // Test util dump finished
-                for (k, v) in reverse_sequence_number_kv_iter(test_count) {
-                    assert_eq!(db.get(&k).await.unwrap(), Some(v));
-                }
+                case.test_get(&db, 1).await;
 
-                if db.manifest.version() > version {
+                if done.is_done() {
                     break;
                 }
             }
-
-            // Test after dump finished
-            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v));
-            }
-
-            // Clean the memtable log, no effect
-            event_sender.send(Event::InactiveLogClean).unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            case.test_get(&db, 1).await;
+            // Clean the memtable log
+            event_sender
+                .notify(Event::InactiveLogClean)
+                .unwrap()
+                .done()
+                .await;
+            case.test_get(&db, 1).await;
 
             db.shutdown().await;
         }
 
-        info!("Test get after dump and clean log");
+        info!("Test recovery get/set after dump and clean log");
         {
             let (db, event_sender, _rx) = create_background_full_control_db(root_path);
+            case.test_get(&db, 1).await;
 
-            for (k, v) in reverse_sequence_number_kv_iter(test_count) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v));
+            case.test_set(&db, 0);
+            case.test_get(&db, 0).await;
+            let mut done = event_sender.notify(Event::Dump).unwrap();
+            event_sender.notify(Event::InactiveLogClean).unwrap();
+            loop {
+                // Test util dump finished
+                case.test_get(&db, 0).await;
+
+                if done.is_done() {
+                    break;
+                }
             }
+            case.test_get(&db, 0).await;
+            // Clean the memtable log
+            event_sender
+                .notify(Event::InactiveLogClean)
+                .unwrap()
+                .done()
+                .await;
+            case.test_get(&db, 0).await;
 
             db.shutdown().await;
         }
+
+        info!("Test recover again");
+        {
+            let (db, _event_sender, _rx) = create_background_full_control_db(root_path);
+            case.test_get(&db, 0).await;
+        }
     }
 
-    #[test(flavor = "multi_thread", worker_threads = 3)]
-    async fn test_db_with_sequence_number() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        tracing::info!("start testing");
-
-        let mut rng = rand::thread_rng();
-        let test_count = 1000000;
-        let get_check_rate = 10;
-        let db = DB::open("./data").unwrap();
-
-        // Set db
-        for i in sequence_number_iter(test_count) {
-            db.set(i.clone(), i.clone()).unwrap();
-        }
-
-        // Get db
-        for i in sequence_number_iter(test_count) {
-            if 0 == rng.gen_range(0..get_check_rate) {
-                assert_eq!(db.get(&i).await.unwrap(), Some(i.clone()));
-            }
-        }
-        db.shutdown().await;
-
-        // Reopen db and test get
-        let db = DB::open("./data").unwrap();
-        for i in sequence_number_iter(test_count) {
-            if 0 == rng.gen_range(0..get_check_rate) {
-                assert_eq!(db.get(&i).await.unwrap(), Some(i.clone()));
-            }
-        }
-
-        // Set db
-        for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
-        {
-            db.set(k, v).unwrap();
-        }
-
-        // Get db
-        for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
-        {
-            if 0 == rng.gen_range(0..get_check_rate) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
-            }
-        }
-
-        // Reopen db and test get
-        db.shutdown().await;
-        let db = DB::open("./data").unwrap();
-        for (k, v) in sequence_number_iter(test_count).zip(reverse_sequence_number_iter(test_count))
-        {
-            if 0 == rng.gen_range(0..get_check_rate) {
-                assert_eq!(db.get(&k).await.unwrap(), Some(v.clone()));
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
-    }
-
+    // Create DB with a manually controllable background task
     fn create_background_full_control_db(
         path: impl Into<PathBuf> + Copy,
-    ) -> (DB, UnboundedSender<Event>, UnboundedReceiver<Event>) {
+    ) -> (DB, EventNotifier, UnboundedReceiver<EventMessage>) {
         let shutdown = Notifier::new();
         let (fake_event_sender, _rx) = unbounded_channel();
         let (event_sender, mut event_builder) = EventLoopBuilder::new();
+        let fake_event_sender = EventNotifier::new(fake_event_sender);
 
         let manifest = Manifest::open(path, fake_event_sender.clone()).unwrap();
         let memtable = MemTable::open(path, fake_event_sender).unwrap();
 
         // Start a background task
-        let mut config = Config::default();
-        config.enable_timer = false;
+        let config = Config {
+            enable_timer: false,
+            ..Default::default()
+        };
         event_builder
             .manifest(manifest.clone())
             .memtable(memtable.clone())
@@ -382,5 +264,58 @@ mod tests {
         };
 
         (db, event_sender, _rx)
+    }
+
+    struct TestCase {
+        case: Vec<(Bytes, Option<Bytes>, Option<Bytes>)>,
+    }
+
+    impl TestCase {
+        fn build_sequence_and_reverse_case(min: usize, max: usize) -> Self {
+            assert!(min < max);
+
+            let mut case = Vec::with_capacity(max - min + 1);
+
+            for k in min..=max {
+                let key = Bytes::from(k.to_string());
+                let val2 = Bytes::from((max - (k - min)).to_string());
+                case.push((key.clone(), Some(key), Some(val2)));
+            }
+            TestCase { case }
+        }
+
+        async fn test_get_part(&self, db: &DB, select: usize, skip: usize, limit: usize) {
+            assert!(select <= 1);
+            for (key, val1, val2) in self.case.iter().skip(skip).take(limit) {
+                let mut val = val1;
+                if select != 0 {
+                    val = val2;
+                }
+                assert_eq!(db.get(key).await.unwrap().as_ref(), val.as_ref());
+            }
+        }
+
+        fn test_set_part(&self, db: &DB, select: usize, skip: usize, limit: usize) {
+            assert!(select <= 1);
+            for (key, val1, val2) in self.case.iter().skip(skip).take(limit) {
+                let mut val = val1;
+                if select != 0 {
+                    val = val2;
+                }
+                if val.is_some() {
+                    db.set(key.clone(), val.as_ref().unwrap().clone()).unwrap();
+                } else {
+                    db.del(key.clone()).unwrap();
+                }
+            }
+        }
+
+        async fn test_get(&self, db: &DB, select: usize) {
+            self.test_get_part(db, select, 0, self.case.len()).await;
+        }
+
+        fn test_set(&self, db: &DB, select: usize) {
+            self.test_set_part(db, select, 0, self.case.len());
+        }
     }
 }

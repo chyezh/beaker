@@ -30,6 +30,7 @@ impl Notifier {
     }
 
     // Create a shutdown signal listener
+    #[inline]
     pub fn listen(&self) -> Option<Listener> {
         self.waiter.0.as_ref().map(|sender| Listener {
             listener: self.sender.subscribe(),
@@ -47,15 +48,18 @@ pub struct Listener {
 
 impl Listener {
     // Listen whether shutdown signal is received
+    #[inline]
     pub async fn listen(&mut self) {
         self.listener.changed().await.unwrap();
     }
 
     // Manually finish
+    #[inline]
     pub fn finish(&mut self) {
         self.finisher.take();
     }
 
     // Do nothing, just hold the listener
+    #[inline]
     pub fn hold(&self) {}
 }

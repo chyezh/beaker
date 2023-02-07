@@ -1,5 +1,5 @@
 use super::{
-    event::Event,
+    event::{Event, EventNotifier},
     record::{RecordReader, RecordWriter},
     util::{async_scan_file_at_path, scan_sorted_file_at_path, Value},
     Error, Result,
@@ -17,7 +17,6 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 
 const KV_HEADER: usize = 8; // key_len + value_len 4+4
@@ -31,15 +30,12 @@ pub struct MemTable {
     immutable: Arc<RwLock<Vec<Arc<KVTable>>>>,
     root_path: PathBuf,
     next_log_seq: Arc<AtomicU64>,
-    event_sender: UnboundedSender<Event>,
+    event_notifier: EventNotifier,
     dump_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl MemTable {
-    pub fn open(
-        root_path: impl Into<PathBuf>,
-        event_sender: UnboundedSender<Event>,
-    ) -> Result<Self> {
+    pub fn open(root_path: impl Into<PathBuf>, event_notifier: EventNotifier) -> Result<Self> {
         // Try to create log root directory at this path.
         let root_path: PathBuf = root_path.into();
         fs::create_dir_all(root_path.as_path())?;
@@ -78,7 +74,7 @@ impl MemTable {
 
         // Try to dump old immutable memtable
         if !immutable.is_empty() {
-            let send_result = event_sender.send(Event::Dump);
+            let send_result = event_notifier.notify(Event::Dump);
             debug_assert!(send_result.is_ok());
         }
 
@@ -87,7 +83,7 @@ impl MemTable {
             immutable: Arc::new(RwLock::new(immutable)),
             root_path,
             next_log_seq: Arc::new(AtomicU64::new(next_log_seq)),
-            event_sender,
+            event_notifier,
             dump_mutex: Arc::new(tokio::sync::Mutex::new(())),
         };
 
@@ -149,7 +145,7 @@ impl MemTable {
 
             // Send a dump request
             // Send operation would never fail
-            let result = self.event_sender.send(Event::Dump);
+            let result = self.event_notifier.notify(Event::Dump);
             debug_assert!(result.is_ok());
         }
 
@@ -183,7 +179,7 @@ impl MemTable {
             *tables = new_tables;
 
             // Try to clear log
-            if let Err(err) = self.event_sender.send(Event::InactiveLogClean) {
+            if let Err(err) = self.event_notifier.notify(Event::InactiveLogClean) {
                 info!(
                     error = err.to_string(),
                     "receiver for inactive log clean trigger has been released"
@@ -365,6 +361,8 @@ mod tests {
         let test_case_key = generate_random_bytes(test_count, 10000);
         let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
         let (tx, _rx) = unbounded_channel();
+
+        let tx = EventNotifier::new(tx);
 
         // Test normal value
         let memtable = MemTable::open("./data", tx.clone()).unwrap();

@@ -1,4 +1,4 @@
-use super::event::Event;
+use super::event::{Event, EventNotifier};
 use super::record::RecordWriter;
 use super::sstable::{self, SSTableEntry};
 use super::util::scan_sorted_file_at_path;
@@ -13,7 +13,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -172,15 +171,12 @@ pub struct Manifest {
     inner: Arc<RwLock<ManifestInner>>,
     persister: Arc<Mutex<ManifestPersister>>,
     root_path: PathBuf,
-    event_sender: UnboundedSender<Event>,
+    event_sender: EventNotifier,
 }
 
 impl Manifest {
     // Open a new manifest record
-    pub fn open(
-        root_path: impl Into<PathBuf>,
-        event_sender: UnboundedSender<Event>,
-    ) -> Result<Self> {
+    pub fn open(root_path: impl Into<PathBuf>, event_sender: EventNotifier) -> Result<Self> {
         // Try to create manifest root directory
         let root_path: PathBuf = root_path.into();
         fs::create_dir_all(sstable_root_path(&root_path))?;
@@ -232,11 +228,6 @@ impl Manifest {
         })
     }
 
-    #[inline]
-    pub fn version(&self) -> u64 {
-        self.inner.read().version
-    }
-
     // Alloc a new sstable entry, and return its writer
     pub fn alloc_new_sstable_entry(&self, lv: usize) -> SSTableEntry {
         SSTableEntry::new(lv, sstable_root_path(&self.root_path))
@@ -266,7 +257,7 @@ impl Manifest {
         *manifest = new_manifest;
 
         // Trigger to find new compact task
-        if let Err(err) = self.event_sender.send(Event::Compact) {
+        if let Err(err) = self.event_sender.notify(Event::Compact) {
             info!(
                 error = err.to_string(),
                 "receiver for compact trigger has been released"
@@ -334,7 +325,7 @@ impl Manifest {
         *manifest = new_manifest;
 
         // Clear old files
-        if let Err(err) = self.event_sender.send(Event::InactiveSSTableClean) {
+        if let Err(err) = self.event_sender.notify(Event::InactiveSSTableClean) {
             info!(
                 error = err.to_string(),
                 "receiver for clean sstable trigger has been released"
@@ -342,7 +333,7 @@ impl Manifest {
         }
 
         // Trigger to find new compact task
-        if let Err(err) = self.event_sender.send(Event::Compact) {
+        if let Err(err) = self.event_sender.notify(Event::Compact) {
             info!(
                 error = err.to_string(),
                 "receiver for compact trigger has been released"

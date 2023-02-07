@@ -2,6 +2,7 @@ use super::{
     compact::Compactor,
     manifest::Manifest,
     memtable::{KVTable, MemTable},
+    Error, Result,
 };
 use crate::{leveldb::sstable, util::shutdown::Listener};
 use std::{
@@ -12,14 +13,16 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{
+        self, error::TryRecvError, unbounded_channel, UnboundedReceiver, UnboundedSender,
+    },
     time::{interval, Interval},
 };
 use tracing::{info, warn};
 
 static EVENT_ID_ALLOC: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Event {
     // Dump a memtable into sstable
     // Trigger
@@ -66,21 +69,22 @@ pub struct EventLoopBuilder {
     manifest: Option<Manifest>,
     memtable: Option<MemTable>,
     shutdown: Option<Listener>,
-    tx: UnboundedSender<Event>,
-    rx: UnboundedReceiver<Event>,
+    tx: EventNotifier,
+    rx: UnboundedReceiver<EventMessage>,
 }
 
 impl EventLoopBuilder {
     // Create a event loop builder
-    pub fn new() -> (UnboundedSender<Event>, EventLoopBuilder) {
+    pub fn new() -> (EventNotifier, EventLoopBuilder) {
         let (tx, rx) = unbounded_channel();
+        let notifier = EventNotifier::new(tx);
         (
-            tx.clone(),
+            notifier.clone(),
             EventLoopBuilder {
                 manifest: None,
                 memtable: None,
                 shutdown: None,
-                tx,
+                tx: notifier,
                 rx,
             },
         )
@@ -123,16 +127,16 @@ impl EventLoopBuilder {
                             break;
                         }
                         _ = config.inactive_reader_clean_period.tick() => {
-                            tx.send(Event::InactiveReaderClean)
+                            tx.notify(Event::InactiveReaderClean)
                         }
                         _ = config.inactive_log_clean_period.tick() => {
-                            tx.send(Event::InactiveLogClean)
+                            tx.notify(Event::InactiveLogClean)
                         }
                         _ = config.inactive_sstable_clean_period.tick() => {
-                            tx.send(Event::InactiveSSTableClean)
+                            tx.notify(Event::InactiveSSTableClean)
                         }
                         _ = config.compact_period.tick() => {
-                            tx.send(Event::Compact)
+                            tx.notify(Event::Compact)
                         }
                     } {
                         warn!(error = err.to_string(), "send event from timer failed");
@@ -157,7 +161,7 @@ impl EventLoopBuilder {
                     event = rx.recv() => {
                         // Receive new event, start a background task to handle it
                         if let Some(event) = event {
-                            EventHandler::new(manifest.clone(), memtable.clone(),shutdown.clone()).handle_event(event);
+                            EventHandler::new(manifest.clone(), memtable.clone(),shutdown.clone(),event).handle_event();
                         } else {
                             break;
                         }
@@ -169,29 +173,106 @@ impl EventLoopBuilder {
     }
 }
 
+#[derive(Clone)]
+pub struct EventMessage {
+    event: Event,
+    _done: Option<mpsc::Sender<()>>,
+}
+
+impl EventMessage {
+    // hold the message in scope, do nothing
+    #[inline]
+    fn hold(&self) {}
+}
+
+pub struct EventWatcher {
+    rx: mpsc::Receiver<()>,
+    done: bool,
+}
+
+impl EventWatcher {
+    #[inline]
+    fn new(rx: mpsc::Receiver<()>) -> Self {
+        EventWatcher { rx, done: false }
+    }
+
+    #[inline]
+    pub async fn done(&mut self) {
+        if self.done {
+            return;
+        }
+        self.rx.recv().await;
+    }
+
+    #[inline]
+    pub fn is_done(&mut self) -> bool {
+        if self.done {
+            return true;
+        }
+
+        if matches!(self.rx.try_recv(), Err(TryRecvError::Disconnected)) {
+            self.done = true;
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Clone)]
+pub struct EventNotifier {
+    sender: UnboundedSender<EventMessage>,
+}
+
+impl EventNotifier {
+    // Create a new event notifier
+    pub fn new(sender: UnboundedSender<EventMessage>) -> Self {
+        EventNotifier { sender }
+    }
+
+    // Notify a event
+    pub fn notify(&self, event: Event) -> Result<EventWatcher> {
+        let (tx, rx) = mpsc::channel(1);
+        self.sender
+            .send(EventMessage {
+                event,
+                _done: Some(tx),
+            })
+            .map_err(|_e| Error::Other)?;
+
+        Ok(EventWatcher::new(rx))
+    }
+}
+
 struct EventHandler {
     manifest: Manifest,
     memtable: MemTable,
     shutdown: Listener,
     id: u64,
+    event: EventMessage,
 }
 
 impl EventHandler {
     // Create a new event handler
-    fn new(manifest: Manifest, memtable: MemTable, shutdown: Listener) -> Self {
+    fn new(
+        manifest: Manifest,
+        memtable: MemTable,
+        shutdown: Listener,
+        event: EventMessage,
+    ) -> Self {
         let id = EVENT_ID_ALLOC.fetch_add(1, Ordering::Relaxed);
         EventHandler {
             manifest,
             memtable,
             shutdown,
             id,
+            event,
         }
     }
 
     // Handle a incoming event
-    fn handle_event(self, event: Event) {
+    fn handle_event(self) {
         tokio::spawn(async move {
-            match event {
+            match self.event.event {
                 Event::Dump => {
                     self.dump().await;
                 }
@@ -223,10 +304,13 @@ impl EventHandler {
             let manifest = self.manifest.clone();
             info!(id = self.id, "compact task found, {:?}", task);
 
-            // Hold a listener copy, to block shutdown util compact task finish
+            // Hold a shutdown and event message copy, to block shutdown util compact task finish and notify compact was finished
             let new_shutdown_listener = self.shutdown.clone();
+            let event = self.event.clone();
             tokio::spawn(async move {
                 new_shutdown_listener.hold();
+                event.hold();
+
                 info!(id = self.id, offset, "start do compact task");
                 if let Err(err) = Compactor::new(task, manifest).compact().await {
                     warn!(
