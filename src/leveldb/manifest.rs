@@ -1,6 +1,6 @@
 use super::event::{Event, EventNotifier};
 use super::record::RecordWriter;
-use super::sstable::{self, SSTableEntry};
+use super::sstable::{self, SSTableEntry, SSTableManager};
 use super::util::scan_sorted_file_at_path;
 use super::{Error, Result};
 use crate::leveldb::record::RecordReader;
@@ -51,7 +51,11 @@ impl ManifestInner {
     }
 
     // Parsing ManifestInner from bytes
-    fn decode_from_bytes(root_path: PathBuf, data: Bytes) -> Result<Self> {
+    fn decode_from_bytes(
+        root_path: PathBuf,
+        data: Bytes,
+        manager: &SSTableManager<tokio::fs::File>,
+    ) -> Result<Self> {
         debug_assert!(data.len() >= MINIMUM_MANIFEST_INNER_SIZE);
         if data.len() < MINIMUM_MANIFEST_INNER_SIZE {
             return Err(Error::IllegalManifest);
@@ -78,10 +82,7 @@ impl ManifestInner {
                 return Err(Error::IllegalManifest);
             }
 
-            let entry = SSTableEntry::decode_from_bytes(
-                root_path.clone(),
-                remain.slice(4..4 + sstable_len),
-            )?;
+            let entry = manager.parse_entry(root_path.clone(), remain.slice(4..4 + sstable_len))?;
 
             // Check if level is valid
             // Level must be monotonic
@@ -172,11 +173,16 @@ pub struct Manifest {
     persister: Arc<Mutex<ManifestPersister>>,
     root_path: PathBuf,
     event_sender: EventNotifier,
+    manager: SSTableManager<tokio::fs::File>,
 }
 
 impl Manifest {
     // Open a new manifest record
-    pub fn open(root_path: impl Into<PathBuf>, event_sender: EventNotifier) -> Result<Self> {
+    pub fn open(
+        root_path: impl Into<PathBuf>,
+        event_sender: EventNotifier,
+        manager: SSTableManager<tokio::fs::File>,
+    ) -> Result<Self> {
         // Try to create manifest root directory
         let root_path: PathBuf = root_path.into();
         fs::create_dir_all(sstable_root_path(&root_path))?;
@@ -203,8 +209,11 @@ impl Manifest {
             match last_valid_manifest_binary {
                 Some(data) => {
                     // Parsing manifest inner information
-                    let inner =
-                        ManifestInner::decode_from_bytes(sstable_root_path(&root_path), data)?;
+                    let inner = ManifestInner::decode_from_bytes(
+                        sstable_root_path(&root_path),
+                        data,
+                        &manager,
+                    )?;
                     (inner, manifest_files.last().unwrap().1 + 1)
                 }
                 None => (ManifestInner::default(), 0),
@@ -225,12 +234,14 @@ impl Manifest {
             root_path,
             persister: Arc::new(Mutex::new(persister)),
             event_sender,
+            manager,
         })
     }
 
     // Alloc a new sstable entry, and return its writer
     pub fn alloc_new_sstable_entry(&self, lv: usize) -> SSTableEntry {
-        SSTableEntry::new(lv, sstable_root_path(&self.root_path))
+        self.manager
+            .alloc_entry(lv, sstable_root_path(&self.root_path))
     }
 
     // Add a new sstable file into manifest, persist modification and update in-memory manifest
@@ -418,7 +429,7 @@ impl Manifest {
                 .and_then(std::ffi::OsStr::to_str)
                 .map(Uuid::from_str)
             {
-                if !sstable::is_active_uuid(&uid) {
+                if !self.manager.is_active_uuid(&uid) {
                     // Remove inactive uuid file
                     tokio::fs::remove_file(filepath).await?;
                     info!("remove inactive sstable file, {}", uid);
@@ -466,7 +477,7 @@ impl CompactTask {
         // Try to get compaction lock
         table.try_compact_lock()?;
         let mut low_lv = CompactSSTables {
-            tables: vec![table.clone()],
+            tables: vec![Arc::clone(table)],
             lv,
         };
         let mut high_lv = CompactSSTables {
@@ -479,9 +490,13 @@ impl CompactTask {
             // Search overlap sstable in level-0
             for (i, other) in manifest.tables[0].iter().enumerate() {
                 if idx != i && range.is_overlap(&other.range) {
-                    // Overlap found, try lock and merge range
+                    // Overlap found, low lv need to make order stable
                     other.try_compact_lock()?;
-                    low_lv.tables.push(other.clone());
+                    if i < idx {
+                        low_lv.tables.insert(0, Arc::clone(other));
+                    } else {
+                        low_lv.tables.push(Arc::clone(other));
+                    }
                     range.get_minimum_contain(&other.range);
                 }
             }
@@ -506,7 +521,7 @@ impl CompactTask {
             if idx > 0 {
                 let other = &manifest.tables[lv][idx - 1];
                 if other.try_compact_lock().is_ok() {
-                    low_lv.tables.insert(0, other.clone());
+                    low_lv.tables.insert(0, Arc::clone(other));
                     range.get_minimum_contain(&other.range);
                 }
             }
@@ -515,7 +530,7 @@ impl CompactTask {
             if idx < low_lv.tables.len() - 1 {
                 let other = &manifest.tables[lv][idx + 1];
                 if other.try_compact_lock().is_ok() {
-                    low_lv.tables.push(other.clone());
+                    low_lv.tables.push(Arc::clone(other));
                     range.get_minimum_contain(&other.range);
                 }
             }
@@ -524,10 +539,10 @@ impl CompactTask {
             if let Some(tables) = manifest.tables.get(lv + 1) {
                 for other in tables.iter() {
                     // Overlap found, try lock
-                    // High level range never overlap with each other, no range merge needed
+                    // High level range never overlap with each other, stable order is not necessary
                     if range.is_overlap(&other.range) {
                         other.try_compact_lock()?;
-                        high_lv.tables.push(other.clone());
+                        high_lv.tables.push(Arc::clone(other));
                         range.get_minimum_contain(&other.range);
                     }
                 }

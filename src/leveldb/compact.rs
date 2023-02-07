@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::manifest::{CompactTask, Manifest};
-use super::sstable::{self, SSTableBuilder, SSTableStream};
+use super::sstable::{SSTableBuilder, SSTableManager, SSTableStream};
 use super::util::Value;
 use super::Result;
 use bytes::Bytes;
@@ -11,11 +11,20 @@ use tokio::io::{AsyncRead, AsyncSeek};
 pub struct Compactor {
     task: CompactTask,
     manifest: Manifest,
+    manager: SSTableManager<tokio::fs::File>,
 }
 
 impl Compactor {
-    pub fn new(task: CompactTask, manifest: Manifest) -> Self {
-        Compactor { task, manifest }
+    pub fn new(
+        task: CompactTask,
+        manifest: Manifest,
+        manager: SSTableManager<tokio::fs::File>,
+    ) -> Self {
+        Compactor {
+            task,
+            manifest,
+            manager,
+        }
     }
 
     // Do the compact operation
@@ -64,7 +73,9 @@ impl Compactor {
         let mut sstables = Vec::with_capacity(self.task.tables().size_hint().0);
         for entry in self.task.tables() {
             // Open a new stream for this entry
-            let s = sstable::open(Arc::clone(entry))
+            let s = self
+                .manager
+                .open(Arc::clone(entry))
                 .await?
                 .open_stream()
                 .await?;
@@ -140,6 +151,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin> SSTablesIter<R> {
         self.kvs[min_idx].take()
     }
 
+    #[inline]
     pub async fn next(&mut self) -> Option<Result<(Bytes, Value)>> {
         if let Err(e) = self.fill_kvs().await {
             return Some(Err(e));

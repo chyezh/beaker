@@ -2,9 +2,10 @@ use super::{
     compact::Compactor,
     manifest::Manifest,
     memtable::{KVTable, MemTable},
+    sstable::SSTableManager,
     Error, Result,
 };
-use crate::{leveldb::sstable, util::shutdown::Listener};
+use crate::util::shutdown::Listener;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -69,6 +70,7 @@ pub struct EventLoopBuilder {
     manifest: Option<Manifest>,
     memtable: Option<MemTable>,
     shutdown: Option<Listener>,
+    manager: Option<SSTableManager<tokio::fs::File>>,
     tx: EventNotifier,
     rx: UnboundedReceiver<EventMessage>,
 }
@@ -84,6 +86,7 @@ impl EventLoopBuilder {
                 manifest: None,
                 memtable: None,
                 shutdown: None,
+                manager: None,
                 tx: notifier,
                 rx,
             },
@@ -108,11 +111,17 @@ impl EventLoopBuilder {
         self
     }
 
+    pub fn manager(&mut self, m: SSTableManager<tokio::fs::File>) -> &mut Self {
+        self.manager = Some(m);
+        self
+    }
+
     // Start a event loop
     pub fn run(mut self, mut config: Config) {
         assert!(self.manifest.is_some());
         assert!(self.memtable.is_some());
         assert!(self.shutdown.is_some());
+        assert!(self.manager.is_some());
         let tx = self.tx.clone();
         // Start timer
         let mut shutdown = self.shutdown.take().unwrap();
@@ -149,9 +158,10 @@ impl EventLoopBuilder {
         tokio::spawn(async move {
             let manifest = self.manifest.take().unwrap();
             let memtable = self.memtable.take().unwrap();
+            let manager = self.manager.take().unwrap();
             let mut rx = self.rx;
 
-            info!("Start a background task event loop...");
+            info!("start a background task event loop...");
             loop {
                 tokio::select! {
                     _ = shutdown.listen() => {
@@ -161,7 +171,7 @@ impl EventLoopBuilder {
                     event = rx.recv() => {
                         // Receive new event, start a background task to handle it
                         if let Some(event) = event {
-                            EventHandler::new(manifest.clone(), memtable.clone(),shutdown.clone(),event).handle_event();
+                            EventHandler::new(manifest.clone(), memtable.clone(), manager.clone(),shutdown.clone(),event ).handle_event();
                         } else {
                             break;
                         }
@@ -246,6 +256,7 @@ impl EventNotifier {
 struct EventHandler {
     manifest: Manifest,
     memtable: MemTable,
+    manager: SSTableManager<tokio::fs::File>,
     shutdown: Listener,
     id: u64,
     event: EventMessage,
@@ -256,6 +267,7 @@ impl EventHandler {
     fn new(
         manifest: Manifest,
         memtable: MemTable,
+        manager: SSTableManager<tokio::fs::File>,
         shutdown: Listener,
         event: EventMessage,
     ) -> Self {
@@ -263,6 +275,7 @@ impl EventHandler {
         EventHandler {
             manifest,
             memtable,
+            manager,
             shutdown,
             id,
             event,
@@ -302,6 +315,7 @@ impl EventHandler {
             .enumerate()
         {
             let manifest = self.manifest.clone();
+            let manager = self.manager.clone();
             info!(id = self.id, "compact task found, {:?}", task);
 
             // Hold a shutdown and event message copy, to block shutdown util compact task finish and notify compact was finished
@@ -312,7 +326,7 @@ impl EventHandler {
                 event.hold();
 
                 info!(id = self.id, offset, "start do compact task");
-                if let Err(err) = Compactor::new(task, manifest).compact().await {
+                if let Err(err) = Compactor::new(task, manifest, manager).compact().await {
                     warn!(
                         id = self.id,
                         offset,
@@ -397,7 +411,7 @@ impl EventHandler {
     // Clean inactive reader
     async fn clean_inactive_readers(self) {
         info!(id = self.id, "start a clean inactive reader task...");
-        sstable::clean_inactive_readers(60);
+        self.manager.clean_inactive_readers(60);
         info!(id = self.id, "clean inactive reader was finished")
     }
 }

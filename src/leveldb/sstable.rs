@@ -5,10 +5,10 @@ use super::{
 };
 use crate::util::{async_util::seek_and_read_buf, checksum, from_le_bytes_32, from_le_bytes_64};
 use bytes::Bytes;
-use lazy_static::lazy_static;
 use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Debug,
     io::{SeekFrom, Write},
     path::PathBuf,
     sync::{
@@ -29,25 +29,6 @@ const FOOTER_SIZE: usize = 12; // 12bytes
 const BLOCK_DEFAULT_SIZE: usize = 4 * 1024; // 4kb
 pub const SSTABLE_FILE_EXTENSION: &str = "tbl";
 const MINIMUM_SSTABLE_ENTRY_SIZE: usize = 28;
-
-lazy_static! {
-    // Global sstable manager
-    pub static ref MANAGER: SSTableManager<File> = SSTableManager::new();
-
-    static ref ORIGINAL_INSTANT: Instant = Instant::now();
-}
-
-pub async fn open(entry: Arc<SSTableEntry>) -> Result<Arc<SSTable<File>>> {
-    MANAGER.open(entry).await
-}
-
-pub fn clean_inactive_readers(secs: u64) {
-    MANAGER.clean_inactive_readers(secs);
-}
-
-pub fn is_active_uuid(uid: &Uuid) -> bool {
-    MANAGER.is_active_uuid(uid)
-}
 
 #[derive(Debug, Default, Clone)]
 pub struct SSTableRange {
@@ -101,74 +82,10 @@ pub struct SSTableEntry {
     pub range: SSTableRange,
     pub root_path: PathBuf,
     compact_lock: AtomicU8,
+    manager: SSTableManager<File>,
 }
 
 impl SSTableEntry {
-    // Create a new SSTableEntry
-    pub fn new(lv: usize, root_path: PathBuf) -> Self {
-        let uid = Uuid::new_v4();
-        // Register uid into global manager
-        MANAGER.register_entry(uid);
-
-        SSTableEntry {
-            lv,
-            uid,
-            root_path,
-            range: SSTableRange::default(),
-            compact_lock: AtomicU8::new(0),
-        }
-    }
-
-    // Parse sstable entry from bytes
-    pub fn decode_from_bytes(root_path: PathBuf, data: Bytes) -> Result<Self> {
-        debug_assert!(data.len() >= MINIMUM_SSTABLE_ENTRY_SIZE);
-        if data.len() < MINIMUM_SSTABLE_ENTRY_SIZE {
-            return Err(Error::IllegalSSTableEntry);
-        }
-
-        let lv = from_le_bytes_32(&data[0..4]);
-        let uid = Uuid::from_bytes_le((&data[4..20]).try_into().unwrap());
-
-        // Parsing range
-        let left_boundary_len = from_le_bytes_32(&data[20..24]);
-        debug_assert!(data.len() >= MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len);
-        if data.len() < MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len {
-            return Err(Error::IllegalSSTableEntry);
-        }
-        let right_boundary_len_start = 24 + left_boundary_len;
-        let left_boundary = data.slice(24..right_boundary_len_start);
-
-        let right_boundary_len =
-            from_le_bytes_32(&data[right_boundary_len_start..right_boundary_len_start + 4]);
-        debug_assert_eq!(
-            data.len(),
-            MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len + right_boundary_len
-        );
-        if data.len() != MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len + right_boundary_len {
-            return Err(Error::IllegalSSTableEntry);
-        }
-        let right_boundary = data
-            .slice(right_boundary_len_start + 4..right_boundary_len_start + 4 + right_boundary_len);
-
-        // Check if sstable file exist
-        if !Self::file_path(root_path.clone(), &uid).is_file() {
-            return Err(Error::IllegalSSTableEntry);
-        }
-
-        // Register uid into global manager
-        MANAGER.register_entry(uid);
-        Ok(SSTableEntry {
-            lv,
-            uid,
-            root_path,
-            compact_lock: AtomicU8::new(0),
-            range: SSTableRange {
-                left: left_boundary,
-                right: right_boundary,
-            },
-        })
-    }
-
     // Consume the entry and open a builder of this entry
     pub async fn open_builder(self) -> Result<SSTableBuilder<File>> {
         let path = Self::file_path(self.root_path.clone(), &self.uid);
@@ -256,7 +173,7 @@ impl SSTableEntry {
 
 impl Drop for SSTableEntry {
     fn drop(&mut self) {
-        MANAGER.drop_entry(&self.uid);
+        self.manager.drop_entry(&self.uid);
     }
 }
 
@@ -573,9 +490,24 @@ pub struct SSTableManager<R: AsyncRead + AsyncSeek + Unpin> {
     active_entry_uid: Arc<parking_lot::Mutex<HashSet<Uuid>>>,
 }
 
+impl<R: AsyncRead + AsyncSeek + Unpin> Debug for SSTableManager<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "()")
+    }
+}
+
+impl<R: AsyncRead + AsyncSeek + Unpin> Clone for SSTableManager<R> {
+    fn clone(&self) -> Self {
+        SSTableManager {
+            readers: Arc::clone(&self.readers),
+            active_entry_uid: Arc::clone(&self.active_entry_uid),
+        }
+    }
+}
+
 impl SSTableManager<File> {
     // Open a sstable with a cache layer
-    async fn open(&self, entry: Arc<SSTableEntry>) -> Result<Arc<SSTable<File>>> {
+    pub async fn open(&self, entry: Arc<SSTableEntry>) -> Result<Arc<SSTable<File>>> {
         // Check whether sstable is already open in cache
         {
             let tables = self.readers.read();
@@ -627,16 +559,81 @@ impl SSTableManager<File> {
     }
 
     // Create a manager
-    fn new() -> Self {
+    pub fn new() -> Self {
         SSTableManager {
             readers: Arc::new(RwLock::new(HashMap::new())),
             active_entry_uid: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         }
     }
 
+    // Alloc a new sstable entry
+    pub fn alloc_entry(&self, lv: usize, root_path: PathBuf) -> SSTableEntry {
+        let uid = Uuid::new_v4();
+        // Register uid into global manager
+        self.register_entry(uid);
+
+        SSTableEntry {
+            lv,
+            uid,
+            root_path,
+            range: SSTableRange::default(),
+            compact_lock: AtomicU8::new(0),
+            manager: self.clone(),
+        }
+    }
+
+    pub fn parse_entry(&self, root_path: PathBuf, data: Bytes) -> Result<SSTableEntry> {
+        debug_assert!(data.len() >= MINIMUM_SSTABLE_ENTRY_SIZE);
+        if data.len() < MINIMUM_SSTABLE_ENTRY_SIZE {
+            return Err(Error::IllegalSSTableEntry);
+        }
+
+        let lv = from_le_bytes_32(&data[0..4]);
+        let uid = Uuid::from_bytes_le((&data[4..20]).try_into().unwrap());
+
+        // Parsing range
+        let left_boundary_len = from_le_bytes_32(&data[20..24]);
+        debug_assert!(data.len() >= MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len);
+        if data.len() < MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len {
+            return Err(Error::IllegalSSTableEntry);
+        }
+        let right_boundary_len_start = 24 + left_boundary_len;
+        let left_boundary = data.slice(24..right_boundary_len_start);
+
+        let right_boundary_len =
+            from_le_bytes_32(&data[right_boundary_len_start..right_boundary_len_start + 4]);
+        debug_assert_eq!(
+            data.len(),
+            MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len + right_boundary_len
+        );
+        if data.len() != MINIMUM_SSTABLE_ENTRY_SIZE + left_boundary_len + right_boundary_len {
+            return Err(Error::IllegalSSTableEntry);
+        }
+        let right_boundary = data
+            .slice(right_boundary_len_start + 4..right_boundary_len_start + 4 + right_boundary_len);
+
+        // Check if sstable file exist
+        if !SSTableEntry::file_path(root_path.clone(), &uid).is_file() {
+            return Err(Error::IllegalSSTableEntry);
+        }
+
+        self.register_entry(uid);
+        Ok(SSTableEntry {
+            lv,
+            uid,
+            root_path,
+            compact_lock: AtomicU8::new(0),
+            range: SSTableRange {
+                left: left_boundary,
+                right: right_boundary,
+            },
+            manager: self.clone(),
+        })
+    }
+
     // Check if a uid is still active
     #[inline]
-    fn is_active_uuid(&self, uid: &Uuid) -> bool {
+    pub fn is_active_uuid(&self, uid: &Uuid) -> bool {
         self.active_entry_uid.lock().contains(uid)
     }
 
@@ -652,7 +649,6 @@ impl SSTableManager<File> {
         self.active_entry_uid.lock().remove(uid);
     }
 }
-
 // Build a single sstable, use leveldb definition without filter block.
 pub struct SSTableBuilder<W> {
     writer: W,
@@ -766,6 +762,7 @@ mod tests {
     #[test]
     async fn test_sstable_builder_and_stream() {
         let _ = env_logger::builder().is_test(true).try_init();
+        let manager = SSTableManager::new();
 
         let test_count = 10000;
         let mut test_case_key = generate_random_bytes(test_count, 1000);
@@ -775,10 +772,10 @@ mod tests {
 
         let uid: Uuid;
         {
-            let entry = SSTableEntry::new(0, "./data".into());
+            let entry = manager.alloc_entry(0, "./data".into());
             uid = entry.uid;
             // Check MANAGER
-            assert!(is_active_uuid(&uid));
+            assert!(manager.is_active_uuid(&uid));
             // Test build
             let mut builder = entry.open_builder().await.unwrap();
             for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
@@ -790,7 +787,7 @@ mod tests {
             let entry = Arc::new(builder.finish().await.unwrap());
 
             // Open sstable
-            let sstable = open(entry).await.unwrap();
+            let sstable = manager.open(entry).await.unwrap();
 
             // Test search
             for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
@@ -811,10 +808,10 @@ mod tests {
             }
 
             // Drop all access entry
-            clean_inactive_readers(0);
+            manager.clean_inactive_readers(0);
         }
 
         // Check MANAGER
-        assert!(!is_active_uuid(&uid));
+        assert!(!manager.is_active_uuid(&uid));
     }
 }

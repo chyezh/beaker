@@ -32,3 +32,4 @@ tonic-build = { version = "0.8" }
 [dev-dependencies]
 test-log = { version = "0.2.11" }
 env_logger = { version = "0.10.0" }
+tempfile = { version = "3.3.0" }
