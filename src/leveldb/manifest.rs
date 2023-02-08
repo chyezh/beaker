@@ -1,6 +1,6 @@
 use super::event::{Event, EventNotifier};
 use super::record::RecordWriter;
-use super::sstable::{self, SSTableEntry, SSTableManager};
+use super::sstable::{self, SSTableEntry, SSTableManager, SSTableRange};
 use super::util::scan_sorted_file_at_path;
 use super::{Error, Result};
 use crate::leveldb::record::RecordReader;
@@ -246,8 +246,7 @@ impl Manifest {
 
     // Add a new sstable file into manifest, persist modification and update in-memory manifest
     pub fn add_new_sstable(&self, entry: SSTableEntry) -> Result<()> {
-        debug_assert!(!entry.range.left.is_empty());
-        debug_assert!(entry.range.left <= entry.range.right);
+        debug_assert!(!entry.range.is_empty());
         debug_assert_eq!(entry.lv, 0);
 
         let manifest = self.inner.upgradable_read();
@@ -278,46 +277,51 @@ impl Manifest {
     }
 
     // Finish compact, try to persist compact result and update in-memory manifest
-    pub fn finish_compact(&self, task: CompactTask) -> Result<()> {
+    pub fn finish_compact(&self, mut task: CompactTask) -> Result<()> {
         let manifest = self.inner.upgradable_read();
-        debug_assert!(manifest.tables.len() > task.low_lv.lv); // Low level layer must exist
-        debug_assert!(manifest.tables.len() >= task.high_lv.lv); // High level layer may be created at compaction
+        let original_lv = task.target_lv() - 1;
+        let target_lv = task.target_lv();
+        let new_sstable_entries = task.take_new();
+        debug_assert!(manifest.tables.len() > original_lv); // Low level layer must exist
+        debug_assert!(manifest.tables.len() >= target_lv); // High level layer may be created at compaction
 
         // Clear outdate entry and add new entry in low or high level layer
         let low_lv_tables = merge_tables(
-            &manifest.tables[task.low_lv.lv],
-            &task.low_lv.tables,
+            &manifest.tables[original_lv],
+            &task.low_lv,
             Vec::new(),
+            original_lv,
         );
-        let high_lv_tables = if manifest.tables.len() > task.high_lv.lv {
+        let high_lv_tables = if manifest.tables.len() > target_lv {
             merge_tables(
-                &manifest.tables[task.high_lv.lv],
-                &task.high_lv.tables,
-                task.new,
+                &manifest.tables[target_lv],
+                &task.high_lv,
+                new_sstable_entries,
+                target_lv,
             )
         } else {
             let origin = Vec::new();
-            merge_tables(&origin, &task.high_lv.tables, task.new)
+            merge_tables(&origin, &task.high_lv, new_sstable_entries, target_lv)
         };
 
         // Construct new tables
         let mut tables = Vec::with_capacity(manifest.tables.len() + 1);
-        for lv in 0..task.low_lv.lv {
+        for lv in 0..original_lv {
             tables.push(manifest.tables[lv].clone());
         }
         tables.push(low_lv_tables);
-        if manifest.tables.len() > task.high_lv.lv {
+        if manifest.tables.len() > target_lv {
             // No new layer
-            for lv in task.low_lv.lv + 1..task.high_lv.lv {
+            for lv in original_lv + 1..target_lv {
                 tables.push(manifest.tables[lv].clone());
             }
             tables.push(high_lv_tables);
-            for lv in task.high_lv.lv + 1..manifest.tables.len() {
+            for lv in target_lv + 1..manifest.tables.len() {
                 tables.push(manifest.tables[lv].clone());
             }
         } else {
             // Add new layer
-            for lv in task.low_lv.lv + 1..manifest.tables.len() {
+            for lv in original_lv + 1..manifest.tables.len() {
                 tables.push(manifest.tables[lv].clone());
             }
             tables.push(high_lv_tables);
@@ -389,25 +393,46 @@ impl Manifest {
     pub fn find_new_compact_tasks(&self) -> Vec<CompactTask> {
         let manifest = self.inner.read();
         let mut tasks = Vec::new();
+        let empty_level = Vec::new();
 
         for (lv, tables) in manifest.tables.iter().enumerate() {
             // Try to compact if level-0's tables count is gte 4
             // Try to compact if other level tables count is gte 10
+
             if (lv == 0 && tables.len() >= 4) || tables.len() >= 10 {
-                for (idx, _) in tables.iter().enumerate() {
-                    if let Ok(mut task) = CompactTask::new(&manifest, lv, idx) {
-                        // The compaction of greatest two level should erase tombstone
-                        if lv + 2 >= manifest.tables.len() {
-                            task.erase_tombstone = true
-                        }
+                let low_lv = &manifest.tables[lv];
+                let high_lv = manifest.tables.get(lv + 1).unwrap_or(&empty_level);
+                // Find one task for one level
+                // Try to find single seed
+                let mut found = false;
+                for idx in 0..tables.len() {
+                    let seed_idx = [idx];
+                    if let Ok(task) = CompactTaskBuilder::new(low_lv, high_lv, lv)
+                        .erase_tombstone(lv + 2 >= manifest.tables.len())
+                        .build(&seed_idx)
+                    {
                         tasks.push(task);
-                        // One compact task for one level
+                        found = true;
                         break;
+                    }
+                }
+
+                // Try to find with multi seed
+                if !found {
+                    for idx in 0..tables.len() - 2 {
+                        let seed_idx = [idx, idx + 1, idx + 2];
+                        if let Ok(task) = CompactTaskBuilder::new(low_lv, high_lv, lv)
+                            .erase_tombstone(lv + 2 >= manifest.tables.len())
+                            .build(&seed_idx)
+                        {
+                            tasks.push(task);
+                            found = true;
+                            break;
+                        }
                     }
                 }
             }
         }
-
         tasks
     }
 
@@ -440,17 +465,136 @@ impl Manifest {
     }
 }
 
-#[derive(Debug)]
-pub struct CompactSSTables {
-    tables: Vec<Arc<SSTableEntry>>,
+struct CompactTaskBuilder<'a> {
+    low_lv: &'a [Arc<SSTableEntry>],
+    high_lv: &'a [Arc<SSTableEntry>],
     lv: usize,
+    erase_tombstone: bool,
+    low_lv_select: Vec<Option<&'a Arc<SSTableEntry>>>,
+    high_lv_select: Vec<Option<&'a Arc<SSTableEntry>>>,
+    range: SSTableRange,
 }
 
-impl Drop for CompactSSTables {
+impl<'a> CompactTaskBuilder<'a> {
+    #[inline]
+    fn new(
+        low_lv: &'a Vec<Arc<SSTableEntry>>,
+        high_lv: &'a Vec<Arc<SSTableEntry>>,
+        lv: usize,
+    ) -> Self {
+        CompactTaskBuilder {
+            low_lv,
+            high_lv,
+            lv,
+            erase_tombstone: false,
+            low_lv_select: vec![None; low_lv.len()],
+            high_lv_select: vec![None; high_lv.len()],
+            range: SSTableRange::default(),
+        }
+    }
+
+    #[inline]
+    fn erase_tombstone(mut self, b: bool) -> Self {
+        self.erase_tombstone = b;
+        self
+    }
+
+    // Add a new sstable into low level
+    fn add_new_low_lv(&mut self, idx: usize) -> Result<()> {
+        debug_assert!(idx < self.low_lv.len());
+        debug_assert_eq!(self.low_lv_select.len(), self.low_lv.len());
+
+        self.low_lv[idx].try_compact_lock()?;
+        self.low_lv_select[idx] = Some(&self.low_lv[idx]);
+        self.range.set_to_minimum_contain(&self.low_lv[idx].range);
+        Ok(())
+    }
+
+    // Add a new index into high level
+    fn add_new_high_lv(&mut self, idx: usize) -> Result<()> {
+        debug_assert!(idx < self.high_lv.len());
+        debug_assert_eq!(self.high_lv_select.len(), self.high_lv.len());
+        debug_assert!(!self.range.is_empty());
+
+        self.high_lv[idx].try_compact_lock()?;
+        self.high_lv_select[idx] = Some(&self.high_lv[idx]);
+        self.range.set_to_minimum_contain(&self.high_lv[idx].range);
+        Ok(())
+    }
+
+    #[inline]
+    fn initial_with_seeds(&mut self, idx_seeds: &'a [usize]) -> Result<()> {
+        debug_assert!(!idx_seeds.is_empty());
+        for &idx in idx_seeds {
+            self.add_new_low_lv(idx)?;
+        }
+        // Range should never be empty
+        debug_assert!(!self.range.is_empty());
+        Ok(())
+    }
+
+    // Build with seeds
+    fn build(mut self, idx_seeds: &'a [usize]) -> Result<CompactTask> {
+        // Initial with given idx seeds and get range of seeds
+        self.initial_with_seeds(idx_seeds)?;
+
+        // Zero level may overlap
+        if self.lv == 0 {
+            debug_assert_eq!(self.low_lv_select.len(), self.low_lv.len());
+            loop {
+                let mut new_select = false;
+                for (i, other) in self.low_lv.iter().enumerate() {
+                    if self.low_lv_select[i].is_none() && self.range.is_overlap(&other.range) {
+                        // Overlap found, recheck overlap again
+                        self.add_new_low_lv(i)?;
+                        new_select = true;
+                    }
+                }
+                if !new_select {
+                    break;
+                }
+            }
+        }
+
+        // Search overlap high level
+        for (i, other) in self.high_lv.iter().enumerate() {
+            if self.high_lv_select[i].is_none() && self.range.is_overlap(&other.range) {
+                // Overlap found
+                // It's no necessary to recheck overlap again, because high level would never overlap
+                self.add_new_high_lv(i)?;
+            }
+        }
+
+        let task = CompactTask {
+            erase_tombstone: self.erase_tombstone,
+            low_lv: self
+                .low_lv_select
+                .iter_mut()
+                .filter_map(|entry| entry.take().cloned())
+                .collect(),
+            high_lv: self
+                .high_lv_select
+                .iter_mut()
+                .filter_map(|entry| entry.take().cloned())
+                .collect(),
+            target_lv: self.lv + 1,
+            new: Some(Vec::new()),
+        };
+
+        if task.low_lv.len() + task.high_lv.len() <= 1 {
+            return Err(Error::Other);
+        }
+        Ok(task)
+    }
+}
+
+impl<'a> Drop for CompactTaskBuilder<'a> {
     fn drop(&mut self) {
         // Should release all compaction lock
-        // CompactTask can be finished or failed
-        for table in self.tables.iter() {
+        for table in self.low_lv_select.iter().filter_map(|&entry| entry) {
+            table.release_lock();
+        }
+        for table in self.high_lv_select.iter().filter_map(|&entry| entry) {
             table.release_lock();
         }
     }
@@ -458,140 +602,63 @@ impl Drop for CompactSSTables {
 
 #[derive(Debug)]
 pub struct CompactTask {
+    low_lv: Vec<Arc<SSTableEntry>>,
+    high_lv: Vec<Arc<SSTableEntry>>,
+    new: Option<Vec<SSTableEntry>>,
+    target_lv: usize,
     erase_tombstone: bool,
-    low_lv: CompactSSTables,
-    high_lv: CompactSSTables,
-    new: Vec<SSTableEntry>,
 }
 
 impl CompactTask {
-    // Create new compact task with given manifest and compact target sstable
-    // Find all overlapping sstables and create task
-    fn new(manifest: &ManifestInner, lv: usize, idx: usize) -> Result<Self> {
-        debug_assert!(manifest.tables.len() > lv);
-        debug_assert!(manifest.tables[lv].len() > idx);
-
-        let table = &manifest.tables[lv][idx];
-        let mut range = table.range.clone();
-
-        // Try to get compaction lock
-        table.try_compact_lock()?;
-        let mut low_lv = CompactSSTables {
-            tables: vec![Arc::clone(table)],
-            lv,
-        };
-        let mut high_lv = CompactSSTables {
-            tables: Vec::new(),
-            lv: lv + 1,
-        };
-
-        // Find all overlap sstable
-        if lv == 0 {
-            // Search overlap sstable in level-0
-            for (i, other) in manifest.tables[0].iter().enumerate() {
-                if idx != i && range.is_overlap(&other.range) {
-                    // Overlap found, low lv need to make order stable
-                    other.try_compact_lock()?;
-                    if i < idx {
-                        low_lv.tables.insert(0, Arc::clone(other));
-                    } else {
-                        low_lv.tables.push(Arc::clone(other));
-                    }
-                    range.get_minimum_contain(&other.range);
-                }
-            }
-        }
-
-        // Search overlap sstable in high level
-        if let Some(tables) = manifest.tables.get(lv + 1) {
-            for other in tables.iter() {
-                // Overlap found, try lock
-                // High level range never overlap with each other, no range merge needed
-                if range.is_overlap(&other.range) {
-                    other.try_compact_lock()?;
-                    high_lv.tables.push(other.clone());
-                    range.get_minimum_contain(&other.range);
-                }
-            }
-        }
-
-        // Add nearby low level sstable to join compact if file is not enough
-        if high_lv.tables.len() + low_lv.tables.len() <= 1 {
-            // Push left item
-            if idx > 0 {
-                let other = &manifest.tables[lv][idx - 1];
-                if other.try_compact_lock().is_ok() {
-                    low_lv.tables.insert(0, Arc::clone(other));
-                    range.get_minimum_contain(&other.range);
-                }
-            }
-
-            // Push right item
-            if idx < low_lv.tables.len() - 1 {
-                let other = &manifest.tables[lv][idx + 1];
-                if other.try_compact_lock().is_ok() {
-                    low_lv.tables.push(Arc::clone(other));
-                    range.get_minimum_contain(&other.range);
-                }
-            }
-
-            // Search overlap sstable in high level again
-            if let Some(tables) = manifest.tables.get(lv + 1) {
-                for other in tables.iter() {
-                    // Overlap found, try lock
-                    // High level range never overlap with each other, stable order is not necessary
-                    if range.is_overlap(&other.range) {
-                        other.try_compact_lock()?;
-                        high_lv.tables.push(Arc::clone(other));
-                        range.get_minimum_contain(&other.range);
-                    }
-                }
-            }
-        }
-
-        // Compact task must contain more than one sstable
-        if low_lv.tables.len() + high_lv.tables.len() <= 1 {
-            return Err(Error::Other);
-        }
-
-        Ok(CompactTask {
-            erase_tombstone: false,
-            low_lv,
-            high_lv,
-            new: Vec::new(),
-        })
-    }
-
     // Get new iterator iterating all tables waiting to compact
     // older kv should be iterated first,
     // so high level should be iterated first,
     #[inline]
     pub fn tables(&self) -> impl Iterator<Item = &Arc<SSTableEntry>> {
-        self.high_lv.tables.iter().chain(self.low_lv.tables.iter())
+        self.high_lv.iter().chain(self.low_lv.iter())
     }
 
     // Get compact target level
     #[inline]
     pub fn compact_size(&self) -> usize {
-        debug_assert!(self.high_lv.lv > 0);
+        debug_assert!(self.target_lv > 0);
         // 10^L MB
-        (10_usize).pow(self.high_lv.lv as u32) * 1024 * 1024
+        (10_usize).pow(self.target_lv as u32) * 1024 * 1024
     }
 
     #[inline]
     pub fn target_lv(&self) -> usize {
-        self.high_lv.lv
+        self.target_lv
     }
 
     // Add new compact result
     #[inline]
     pub fn add_compact_result(&mut self, entry: SSTableEntry) {
-        self.new.push(entry);
+        if !entry.range.is_empty() {
+            self.new.as_mut().unwrap().push(entry);
+        }
     }
 
     #[inline]
     pub fn need_erase_tombstone(&self) -> bool {
         self.erase_tombstone
+    }
+
+    #[inline]
+    pub fn take_new(&mut self) -> Vec<SSTableEntry> {
+        self.new.take().unwrap()
+    }
+}
+
+impl Drop for CompactTask {
+    fn drop(&mut self) {
+        // Should release all compaction lock
+        for table in self.low_lv.iter() {
+            table.release_lock();
+        }
+        for table in self.high_lv.iter() {
+            table.release_lock();
+        }
     }
 }
 
@@ -600,6 +667,7 @@ fn merge_tables(
     origin: &Vec<Arc<SSTableEntry>>,
     clear: &Vec<Arc<SSTableEntry>>,
     new: Vec<SSTableEntry>,
+    lv: usize,
 ) -> Vec<Arc<SSTableEntry>> {
     let new_len = new.len();
     let mut new_tables = Vec::with_capacity(origin.len() - clear.len() + new_len);
@@ -623,8 +691,10 @@ fn merge_tables(
         new_tables.push(Arc::new(entry));
     }
 
-    // Sort entry
-    new_tables.sort_by_key(|elem| elem.sort_key());
+    // Non-zero level must keep sstable sorted by key range
+    if lv > 0 {
+        new_tables.sort_by_key(|elem| elem.sort_key_range());
+    }
 
     debug_assert_eq!(new_tables.len() + clear.len() - new_len, origin.len());
     new_tables

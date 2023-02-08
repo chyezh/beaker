@@ -32,14 +32,18 @@ const MINIMUM_SSTABLE_ENTRY_SIZE: usize = 28;
 
 #[derive(Debug, Default, Clone)]
 pub struct SSTableRange {
-    pub left: Bytes,
-    pub right: Bytes,
+    left: Bytes,
+    right: Bytes,
 }
 
 // Describe range info of sstable
 impl SSTableRange {
     // Get minimum contain two range
-    pub fn get_minimum_contain(&mut self, other: &SSTableRange) {
+    pub fn set_to_minimum_contain(&mut self, other: &SSTableRange) {
+        if self.is_empty() {
+            self.left = other.left.clone();
+            self.right = other.right.clone();
+        }
         if self.is_overlap(other) {
             if self.left > other.left {
                 self.left = other.left.clone()
@@ -50,17 +54,30 @@ impl SSTableRange {
         }
     }
 
+    #[inline]
+    pub fn set(&mut self, left: Bytes, right: Bytes) {
+        debug_assert!(!left.is_empty());
+        debug_assert!(!right.is_empty());
+        debug_assert!(left <= right);
+
+        self.left = left;
+        self.right = right;
+    }
+
     // Check if two range is overlapping
+    #[inline]
     pub fn is_overlap(&self, other: &SSTableRange) -> bool {
         !(self.right < other.left || self.left > other.right)
     }
 
     // Check if a key in this range
+    #[inline]
     pub fn in_range(&self, key: &[u8]) -> bool {
         key >= self.left && key <= self.right
     }
 
     // Order with given key
+    #[inline]
     pub fn order(&self, key: &[u8]) -> std::cmp::Ordering {
         if key < self.left {
             std::cmp::Ordering::Greater
@@ -69,6 +86,11 @@ impl SSTableRange {
         } else {
             std::cmp::Ordering::Equal
         }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.left.is_empty() || self.right.is_empty()
     }
 }
 
@@ -103,7 +125,6 @@ impl SSTableEntry {
             last_key: Vec::with_capacity(128),
             offset: 0,
             complete_data_block_size: 0,
-            range: (None, None),
             entry: self,
         })
     }
@@ -141,15 +162,18 @@ impl SSTableEntry {
     }
 
     // release compact lock
+    #[inline]
     pub fn release_lock(&self) {
         // release the lock
         self.compact_lock.store(0, Ordering::Release);
     }
 
-    pub fn sort_key(&self) -> Bytes {
+    #[inline]
+    pub fn sort_key_range(&self) -> Bytes {
         self.range.left.clone()
     }
 
+    #[inline]
     pub fn file_path(root_path: PathBuf, uid: &Uuid) -> PathBuf {
         let file_name = format!("{}.{}", uid, SSTABLE_FILE_EXTENSION);
         root_path.join(file_name)
@@ -161,13 +185,6 @@ impl SSTableEntry {
         let path = Self::file_path(self.root_path.clone(), &self.uid);
         let new_file = File::open(path).await?;
         Ok(new_file)
-    }
-
-    // Set range into entry
-    #[inline]
-    fn set_range(&mut self, range: SSTableRange) {
-        debug_assert!(range.left <= range.right);
-        self.range = range;
     }
 }
 
@@ -657,7 +674,6 @@ pub struct SSTableBuilder<W> {
     last_key: Vec<u8>,
     offset: u64,
     complete_data_block_size: usize,
-    range: (Option<Bytes>, Option<Bytes>),
     entry: SSTableEntry,
 }
 
@@ -679,10 +695,10 @@ impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
         }
 
         // Update range
-        if self.range.0.is_none() {
-            self.range.0 = Some(key.clone());
+        if self.entry.range.left.is_empty() {
+            self.entry.range.left = key.clone();
         }
-        self.range.1 = Some(key);
+        self.entry.range.right = key.clone();
 
         // Return size estimate
         Ok(complete_data_block_size + block_size + self.index_block.size_estimate())
@@ -690,9 +706,6 @@ impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
 
     // Finish a table construction, and get the sstable entry
     pub async fn finish(mut self) -> Result<SSTableEntry> {
-        debug_assert!(self.range.0.is_some());
-        debug_assert!(self.range.1.is_some());
-
         // Append new data block if data_block is not empty
         if !self.data_block.is_empty() {
             let (offset, data_size) = self.flush_new_data_block().await?;
@@ -716,13 +729,6 @@ impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
         self.writer
             .write_all(&Footer::new(index_offset, index_size).to_bytes())
             .await?;
-
-        // Set range into entry
-        self.entry.set_range(SSTableRange {
-            left: self.range.0.as_ref().unwrap().clone(),
-            right: self.range.1.as_ref().unwrap().clone(),
-        });
-
         Ok(self.entry)
     }
 

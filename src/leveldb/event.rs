@@ -14,9 +14,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::mpsc::{
-        self, error::TryRecvError, unbounded_channel, UnboundedReceiver, UnboundedSender,
-    },
+    sync::mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
     time::{interval, Interval},
 };
 use tracing::{info, warn};
@@ -94,24 +92,24 @@ impl EventLoopBuilder {
     }
 
     // Set up manifest
-    pub fn manifest(&mut self, m: Manifest) -> &mut Self {
+    pub fn manifest(mut self, m: Manifest) -> Self {
         self.manifest = Some(m);
         self
     }
 
     // Set up memtable
-    pub fn memtable(&mut self, m: MemTable) -> &mut Self {
+    pub fn memtable(mut self, m: MemTable) -> Self {
         self.memtable = Some(m);
         self
     }
 
     // Set up shutdown listener
-    pub fn shutdown(&mut self, s: Listener) -> &mut Self {
+    pub fn shutdown(mut self, s: Listener) -> Self {
         self.shutdown = Some(s);
         self
     }
 
-    pub fn manager(&mut self, m: SSTableManager<tokio::fs::File>) -> &mut Self {
+    pub fn manager(mut self, m: SSTableManager<tokio::fs::File>) -> Self {
         self.manager = Some(m);
         self
     }
@@ -196,32 +194,40 @@ impl EventMessage {
 }
 
 pub struct EventWatcher {
-    rx: mpsc::Receiver<()>,
-    done: bool,
+    _rx: mpsc::Receiver<()>,
+    _done: bool,
 }
 
 impl EventWatcher {
     #[inline]
     fn new(rx: mpsc::Receiver<()>) -> Self {
-        EventWatcher { rx, done: false }
+        EventWatcher {
+            _rx: rx,
+            _done: false,
+        }
     }
 
+    #[cfg(test)]
     #[inline]
     pub async fn done(&mut self) {
-        if self.done {
+        if self._done {
             return;
         }
-        self.rx.recv().await;
+        self._rx.recv().await;
     }
 
+    #[cfg(test)]
     #[inline]
     pub fn is_done(&mut self) -> bool {
-        if self.done {
+        if self._done {
             return true;
         }
 
-        if matches!(self.rx.try_recv(), Err(TryRecvError::Disconnected)) {
-            self.done = true;
+        if matches!(
+            self._rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ) {
+            self._done = true;
             return true;
         }
         false

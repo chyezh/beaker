@@ -2,9 +2,7 @@ use crate::leveldb::event::Config;
 use crate::util::shutdown::Notifier;
 
 use super::sstable::SSTableManager;
-use super::{
-    event::EventLoopBuilder, manifest::Manifest, memtable::MemTable, sstable, util::Value, Result,
-};
+use super::{event::EventLoopBuilder, manifest::Manifest, memtable::MemTable, util::Value, Result};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -26,7 +24,7 @@ impl DB {
         let path = path.into();
         let shutdown = Notifier::new();
         let manager = SSTableManager::new();
-        let (event_sender, mut event_builder) = EventLoopBuilder::new();
+        let (event_sender, event_builder) = EventLoopBuilder::new();
 
         info!("open manifest...");
         let manifest = Manifest::open(path.clone(), event_sender.clone(), manager.clone())?;
@@ -38,8 +36,8 @@ impl DB {
             .manifest(manifest.clone())
             .memtable(memtable.clone())
             .manager(manager.clone())
-            .shutdown(shutdown.listen().unwrap());
-        event_builder.run(Config::default());
+            .shutdown(shutdown.listen().unwrap())
+            .run(Config::default());
 
         info!("open DB complete");
         Ok(DB {
@@ -111,13 +109,34 @@ mod tests {
     use tracing::log::info;
 
     #[test(flavor = "multi_thread", worker_threads = 3)]
+    async fn test_open() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (db, _event_sender, _rx) = create_background_full_control_db("./data");
+        let entry = db.manifest.search(&Bytes::from("100220136"));
+        for e in entry {
+            let mut s = db
+                .manager
+                .open(e)
+                .await
+                .unwrap()
+                .open_stream()
+                .await
+                .unwrap();
+            while let Some(Ok((key, val))) = s.next().await {
+                println!("key: {:?}, val:{:?}", key, val);
+            }
+        }
+
+        db.shutdown().await
+    }
+
+    #[test(flavor = "multi_thread", worker_threads = 3)]
     async fn test_db_multi_set_with_sequence_case() {
         let _ = env_logger::builder().is_test(true).try_init();
         let min = 100000000;
         let max = 101000000;
         let temp_dir = tempdir().unwrap();
         let root_path = temp_dir.path();
-        let root_path = "./data";
         let case = TestCase::build_sequence_and_reverse_case(min, max);
 
         info!("Start test of path, {:?}", root_path);
@@ -429,12 +448,13 @@ mod tests {
     ) -> (DB, EventNotifier, UnboundedReceiver<EventMessage>) {
         let shutdown = Notifier::new();
         let (fake_event_sender, _rx) = unbounded_channel();
-        let (event_sender, mut event_builder) = EventLoopBuilder::new();
+        let (event_sender, event_builder) = EventLoopBuilder::new();
         let fake_event_sender = EventNotifier::new(fake_event_sender);
 
         let manifest =
             Manifest::open(path, fake_event_sender.clone(), SSTableManager::new()).unwrap();
         let memtable = MemTable::open(path, fake_event_sender).unwrap();
+        let manager = SSTableManager::new();
 
         // Start a background task
         let config = Config {
@@ -444,14 +464,15 @@ mod tests {
         event_builder
             .manifest(manifest.clone())
             .memtable(memtable.clone())
-            .shutdown(shutdown.listen().unwrap());
-        event_builder.run(config);
+            .manager(manager.clone())
+            .shutdown(shutdown.listen().unwrap())
+            .run(config);
 
         let db = DB {
             manifest,
             memtable,
             shutdown: Arc::new(Mutex::new(Some(shutdown))),
-            manager: SSTableManager::new(),
+            manager,
         };
 
         (db, event_sender, _rx)

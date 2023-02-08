@@ -18,4 +18,4 @@ Cargo.lock
 .vscode
 
 # Added by test
-/data
+/data*
