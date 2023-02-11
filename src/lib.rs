@@ -1,8 +1,8 @@
 mod cmd;
-mod leveldb;
+mod engine;
 mod resp;
 mod server;
 mod util;
 
-pub use leveldb::DB;
+pub use engine::DB;
 pub use server::Server;

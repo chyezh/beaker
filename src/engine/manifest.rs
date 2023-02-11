@@ -3,7 +3,7 @@ use super::record::RecordWriter;
 use super::sstable::{self, SSTableEntry, SSTableManager, SSTableRange};
 use super::util::scan_sorted_file_at_path;
 use super::{Error, Result};
-use crate::leveldb::record::RecordReader;
+use crate::engine::record::RecordReader;
 use crate::util::{from_le_bytes_32, from_le_bytes_64};
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};

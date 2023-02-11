@@ -1,8 +1,12 @@
-use crate::leveldb::event::Config;
+use super::{
+    event::{Config, EventLoopBuilder},
+    manifest::Manifest,
+    memtable::MemTable,
+    sstable::SSTableManager,
+    util::Value,
+    Result,
+};
 use crate::util::shutdown::Notifier;
-
-use super::sstable::SSTableManager;
-use super::{event::EventLoopBuilder, manifest::Manifest, memtable::MemTable, util::Value, Result};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -97,7 +101,7 @@ impl DB {
 mod tests {
     use super::{super::event::Event, *};
     use crate::{
-        leveldb::event::{EventMessage, EventNotifier},
+        engine::event::{EventMessage, EventNotifier},
         util::shutdown::Notifier,
     };
     use rand::Rng;
