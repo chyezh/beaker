@@ -55,6 +55,7 @@ impl SSTableRange {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn set(&mut self, left: Bytes, right: Bytes) {
         debug_assert!(!left.is_empty());
         debug_assert!(!right.is_empty());

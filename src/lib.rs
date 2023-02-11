@@ -1,5 +1,4 @@
 mod cmd;
-mod engine;
 mod leveldb;
 mod resp;
 mod server;

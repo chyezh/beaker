@@ -426,7 +426,6 @@ impl Manifest {
                             .build(&seed_idx)
                         {
                             tasks.push(task);
-                            found = true;
                             break;
                         }
                     }

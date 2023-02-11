@@ -7,6 +7,7 @@ pub mod shutdown;
 static CRC_INSTANCE: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 // Seek reader and read n exact bytes
+#[allow(dead_code)]
 pub fn seek_and_read_buf<R: Read + Seek>(
     reader: &mut R,
     seek: SeekFrom,
@@ -67,6 +68,7 @@ pub fn from_le_bytes_32(data: &[u8]) -> usize {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub mod test_case {
     use bytes::Bytes;
 

@@ -34,7 +34,7 @@ impl Notifier {
     pub fn listen(&self) -> Option<Listener> {
         self.waiter.0.as_ref().map(|sender| Listener {
             listener: self.sender.subscribe(),
-            finisher: Some(sender.clone()),
+            _finisher: Some(sender.clone()),
         })
     }
 }
@@ -43,7 +43,7 @@ impl Notifier {
 pub struct Listener {
     listener: watch::Receiver<bool>,
     // Finish when listener is drop
-    finisher: Option<mpsc::Sender<()>>,
+    _finisher: Option<mpsc::Sender<()>>,
 }
 
 impl Listener {
@@ -55,8 +55,9 @@ impl Listener {
 
     // Manually finish
     #[inline]
+    #[allow(dead_code)]
     pub fn finish(&mut self) {
-        self.finisher.take();
+        self._finisher.take();
     }
 
     // Do nothing, just hold the listener
