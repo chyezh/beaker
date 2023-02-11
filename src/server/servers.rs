@@ -2,7 +2,6 @@ use tokio::net::{TcpListener, ToSocketAddrs};
 
 use super::{connection::Connection, handler::Handler, Result};
 use crate::leveldb::DB;
-use std::sync::Arc;
 
 pub struct Server {
     db: DB,

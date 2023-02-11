@@ -763,6 +763,7 @@ impl<W: AsyncWrite + Unpin> SSTableBuilder<W> {
 mod tests {
     use super::*;
     use crate::util::test_case::generate_random_bytes;
+    use tempfile::tempdir;
     use tokio::test;
 
     #[test]
@@ -770,15 +771,18 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let manager = SSTableManager::new();
 
+        let temp_dir = tempdir().unwrap();
+        let root_path = temp_dir.path();
+
         let test_count = 10000;
         let mut test_case_key = generate_random_bytes(test_count, 1000);
         let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
         test_case_key.sort();
-        std::fs::create_dir_all("./data").unwrap();
+        std::fs::create_dir_all(root_path).unwrap();
 
         let uid: Uuid;
         {
-            let entry = manager.alloc_entry(0, "./data".into());
+            let entry = manager.alloc_entry(0, root_path.into());
             uid = entry.uid;
             // Check MANAGER
             assert!(manager.is_active_uuid(&uid));

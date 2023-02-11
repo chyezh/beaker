@@ -109,28 +109,6 @@ mod tests {
     use tracing::log::info;
 
     #[test(flavor = "multi_thread", worker_threads = 3)]
-    async fn test_open() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let (db, _event_sender, _rx) = create_background_full_control_db("./data");
-        let entry = db.manifest.search(&Bytes::from("100220136"));
-        for e in entry {
-            let mut s = db
-                .manager
-                .open(e)
-                .await
-                .unwrap()
-                .open_stream()
-                .await
-                .unwrap();
-            while let Some(Ok((key, val))) = s.next().await {
-                println!("key: {:?}, val:{:?}", key, val);
-            }
-        }
-
-        db.shutdown().await
-    }
-
-    #[test(flavor = "multi_thread", worker_threads = 3)]
     async fn test_db_multi_set_with_sequence_case() {
         let _ = env_logger::builder().is_test(true).try_init();
         let min = 100000000;

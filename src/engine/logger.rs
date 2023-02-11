@@ -173,11 +173,16 @@ fn scan_sorted_file_at_path(path: &Path) -> Result<Vec<(PathBuf, u64)>> {
     Ok(filenames)
 }
 
+#[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     #[test]
     fn test_splitted_file_writer() {
         use super::{Command, SplittedFileLogWriter};
-        let mut logger = SplittedFileLogWriter::open_unchecked("./data").unwrap();
+        let temp_dir = tempdir().unwrap();
+        let root_path = temp_dir.path();
+        let mut logger = SplittedFileLogWriter::open_unchecked(root_path).unwrap();
 
         logger.write_cmd(&Command::del("123123".into())).unwrap();
         logger.write_cmd(&Command::del("123123".into())).unwrap();
@@ -192,7 +197,9 @@ mod tests {
     #[test]
     fn test_splitted_file_reader() {
         use super::{Command, SplittedFileLogReader};
-        let reader = SplittedFileLogReader::open("./data").unwrap();
+        let temp_dir = tempdir().unwrap();
+        let root_path = temp_dir.path();
+        let reader = SplittedFileLogReader::open(root_path).unwrap();
 
         let mut cnt = 0;
         for c in reader {

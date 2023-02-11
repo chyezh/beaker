@@ -322,6 +322,7 @@ impl KVTable {
 mod tests {
     use core::panic;
 
+    use tempfile::tempdir;
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
@@ -356,6 +357,8 @@ mod tests {
 
     #[test]
     fn test_log_with_random_case() {
+        let temp_dir = tempdir().unwrap();
+        let root_path = temp_dir.path();
         let test_count = 100;
 
         let test_case_key = generate_random_bytes(test_count, 10000);
@@ -365,7 +368,7 @@ mod tests {
         let tx = EventNotifier::new(tx);
 
         // Test normal value
-        let memtable = MemTable::open("./data", tx.clone()).unwrap();
+        let memtable = MemTable::open(root_path, tx.clone()).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             memtable
                 .set(key.clone(), Value::Living(value.clone()))
@@ -373,7 +376,7 @@ mod tests {
         }
 
         drop(memtable);
-        let memtable = MemTable::open("./data", tx.clone()).unwrap();
+        let memtable = MemTable::open(root_path, tx.clone()).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             if let Some(Value::Living(v)) = memtable.get(key) {
                 assert_eq!(value, &v);
@@ -391,7 +394,7 @@ mod tests {
         }
 
         drop(memtable);
-        let memtable = MemTable::open("./data", tx.clone()).unwrap();
+        let memtable = MemTable::open(root_path, tx.clone()).unwrap();
         for ((key, value), is_deleted) in test_case_key
             .iter()
             .zip(test_case_value.iter())
@@ -420,7 +423,7 @@ mod tests {
         }
 
         drop(memtable);
-        let memtable = MemTable::open("./data", tx).unwrap();
+        let memtable = MemTable::open(root_path, tx).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             if let Some(Value::Living(v)) = memtable.get(key) {
                 assert_eq!(value, &v);
