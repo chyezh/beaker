@@ -1,8 +1,10 @@
+mod client;
 mod cmd;
 mod engine;
 mod resp;
 mod server;
 mod util;
 
+pub use client::Client;
 pub use engine::DB;
 pub use server::Server;

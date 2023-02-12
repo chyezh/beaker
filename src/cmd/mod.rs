@@ -1,6 +1,6 @@
-use crate::resp::{Frame, Parser};
-use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
+use crate::resp::{Frame, Parser};
 mod error;
 pub use error::Error;
 
@@ -18,7 +18,7 @@ pub use del::Del;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Get(Get),
     Ping(Ping),
@@ -44,20 +44,27 @@ impl Command {
 
         Ok(cmd)
     }
+}
 
-    pub fn get(key: String) -> Self {
-        Command::Get(Get::new(key))
-    }
+impl FromStr for Command {
+    type Err = Error;
 
-    pub fn ping() -> Self {
-        Command::Ping(Ping::default())
-    }
+    // Convert string from terminal input into command struct
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let s = s.trim_start();
 
-    pub fn set(key: String, val: String) -> Self {
-        Command::Set(Set::new(key, val))
-    }
+        let (command_name, remain) = if let Some((cmd, content)) = s.split_once(' ') {
+            (cmd, content)
+        } else {
+            (s, "")
+        };
 
-    pub fn del(key: String) -> Self {
-        Command::Del(Del::new(key))
+        todo!()
     }
+}
+
+pub trait ResponseParser {
+    type Response;
+
+    fn parse_response(&self, parser: &mut Parser) -> Result<Self::Response>;
 }

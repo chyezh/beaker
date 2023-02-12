@@ -1,21 +1,21 @@
-use super::{connection::Connection, Result};
+use super::Result;
 use crate::cmd::Command;
 use crate::engine::DB;
-use crate::resp::Frame;
-use bytes::Bytes;
+use crate::resp::{Connection, Frame};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 // Process a connection sequentially.
 // 1. Transfer connection frame into command
 // 2. Send command to DB engine
 // 3. Transfer result of command into frame and write to connection.
-pub struct Handler {
+pub struct Handler<T> {
     db: DB,
-    conn: Connection,
+    conn: Connection<T>,
 }
 
-impl Handler {
+impl<T: AsyncRead + AsyncWrite + Unpin> Handler<T> {
     // Create a new handler with given db engine and connection
-    pub fn new(db: DB, conn: Connection) -> Self {
+    pub fn new(db: DB, conn: Connection<T>) -> Self {
         Handler { db, conn }
     }
 
@@ -31,31 +31,38 @@ impl Handler {
 
             // Parse command and apply command
             let cmd = Command::from_frame(frame.into_iter())?;
-            apply(&cmd, self.db.clone(), &mut self.conn).await?;
+
+            match apply(cmd, self.db.clone()).await {
+                Ok(response) => {
+                    self.conn.write_frame(&response).await?;
+                    self.conn.flush().await?;
+                }
+                Err(err) => {
+                    // Send error if error happened in apply function
+                    self.conn
+                        .write_frame(&Frame::Error(err.to_string()))
+                        .await?;
+                }
+            }
         }
     }
 }
 
 // Apply command to db engine, and write result of command into connection
-async fn apply(cmd: &Command, db: DB, conn: &mut Connection) -> Result<()> {
-    conn.write_frame(&match cmd {
-        Command::Get(get) => match db
-            .get(&Bytes::copy_from_slice(get.key().as_bytes()))
-            .await?
-        {
-            Some(val) => Frame::Bulk(val),
-            None => Frame::Null,
-        },
-        Command::Ping(_) => Frame::Simple("pong".into()),
+async fn apply(cmd: Command, db: DB) -> Result<Frame> {
+    Ok(match cmd {
+        Command::Get(get) => {
+            let val = db.get(get.raw_key()).await?;
+            get.response(val)
+        }
+        Command::Ping(ping) => ping.response(),
         Command::Set(set) => {
-            db.set(Bytes::copy_from_slice(set.key().as_bytes()), set.val())?;
-            Frame::Simple("OK".into())
+            db.set(set.key(), set.val())?;
+            set.response()
         }
         Command::Del(del) => {
-            db.del(Bytes::copy_from_slice(del.key().as_bytes()))?;
-            Frame::Integer(1)
+            db.del(del.key())?;
+            del.response()
         }
     })
-    .await?;
-    Ok(())
 }

@@ -1,12 +1,13 @@
-use bytes::{Buf, Bytes};
-use tokio::io::AsyncWriteExt;
-
 use super::{Error, Result};
-use std::{
-    io::{Cursor, Write},
-    usize,
-};
+use bytes::{Buf, Bytes};
+use std::io::{Cursor, Write};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+pub trait IntoFrame {
+    fn into_frame(&self) -> Frame;
+}
+
+/// An enum for RESP frame
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     Simple(String),
@@ -18,7 +19,7 @@ pub enum Frame {
 }
 
 impl Frame {
-    /// create a new array Frame
+    /// Create a new array Frame
     pub fn array() -> Frame {
         Frame::Array(vec![])
     }
@@ -127,7 +128,7 @@ impl Frame {
         }
     }
 
-    pub async fn write_to<W: AsyncWriteExt + Unpin>(&self, w: &mut W) -> Result<()> {
+    pub async fn write_to<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
         match self {
             Frame::Array(val) => {
                 w.write_u8(b'*').await?;
@@ -144,7 +145,7 @@ impl Frame {
         Ok(())
     }
 
-    async fn write_single_to<W: AsyncWriteExt + Unpin>(&self, w: &mut W) -> Result<()> {
+    async fn write_single_to<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
         match self {
             Frame::Simple(val) => {
                 w.write_u8(b'+').await?;
@@ -174,6 +175,19 @@ impl Frame {
             Frame::Array(_) => unreachable!(),
         }
         Ok(())
+    }
+}
+
+impl From<String> for Frame {
+    fn from(value: String) -> Self {
+        Frame::Simple(value)
+    }
+}
+
+// Convert bytes into frame bulk
+impl From<Bytes> for Frame {
+    fn from(value: Bytes) -> Self {
+        Frame::Bulk(value)
     }
 }
 

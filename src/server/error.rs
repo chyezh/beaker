@@ -1,29 +1,14 @@
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("io")]
-    Io {
-        #[from]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 
-    #[error("resp")]
-    Resp {
-        #[from]
-        source: crate::resp::Error,
-    },
+    #[error(transparent)]
+    Resp(#[from] crate::resp::Error),
 
-    #[error("db")]
-    Db {
-        #[from]
-        source: crate::engine::Error,
-    },
+    #[error(transparent)]
+    Db(#[from] crate::engine::Error),
 
-    #[error("cmd")]
-    Cmd {
-        #[from]
-        source: crate::cmd::Error,
-    },
-
-    #[error("connection is rest by peer")]
-    ConnReset,
+    #[error(transparent)]
+    Cmd(#[from] crate::cmd::Error),
 }

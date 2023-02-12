@@ -1,6 +1,7 @@
 use beaker::{Server, DB};
 #[tokio::main]
 async fn main() {
+    let _ = env_logger::builder().try_init();
     let db = DB::open("./data").unwrap();
     let server = Server::new(db);
 

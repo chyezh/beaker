@@ -1,10 +1,7 @@
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("io")]
-    Io {
-        #[from]
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 
     #[error("illegal value binary format")]
     IllegalValueBinary,
