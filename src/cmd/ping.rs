@@ -17,6 +17,12 @@ impl Ping {
         Ping { msg }
     }
 
+    /// Obtain msg
+    #[inline]
+    pub fn msg(&self) -> Option<Bytes> {
+        self.msg.clone()
+    }
+
     /// Create a new ping command from parser
     #[inline]
     pub fn from_parser(parser: &mut Parser) -> Result<Self> {

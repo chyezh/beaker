@@ -10,6 +10,15 @@ pub enum Error {
 
     #[error("invalid arguments count")]
     InvalidArgsCount,
+
+    #[error(transparent)]
+    Client(#[from] crate::client::Error),
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    Utf8(#[from] std::string::FromUtf8Error),
 }
 
 impl<E: Debug> From<nom::Err<E>> for Error {

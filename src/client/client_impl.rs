@@ -1,6 +1,6 @@
 use super::Result;
 use crate::client::Error;
-use crate::cmd::{Del, Get, Ping, ResponseParser, Set};
+use crate::cmd::{Command, Del, Get, Ping, ResponseParser, Set};
 use crate::resp::{AsFrame, Connection, ConnectionPool, Connector, Frame, Parser};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, BufWriter};
@@ -84,7 +84,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, T: Connector<Stream = S>> Client<T> {
     }
 
     /// Apply a command to client, and parse response
-    pub async fn apply_cmd<C: AsFrame + ResponseParser>(&self, cmd: C) -> Result<C::Response> {
+    async fn apply_cmd<C: AsFrame + ResponseParser>(&self, cmd: C) -> Result<C::Response> {
         let mut conn = self.pool.connect().await?;
 
         let frame = cmd.as_frame();

@@ -25,8 +25,8 @@ pub fn parse(input: &str) -> Result<Command> {
     match cmd.to_uppercase().as_str() {
         GET_COMMAND_NAME => get(args),
         PING_COMMAND_NAME => ping(args),
-        DEL_COMMAND_NAME => set(args),
-        SET_COMMAND_NAME => del(args),
+        SET_COMMAND_NAME => set(args),
+        DEL_COMMAND_NAME => del(args),
         _ => unreachable!(),
     }
 }
