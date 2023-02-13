@@ -3,8 +3,8 @@ use bytes::{Buf, Bytes};
 use std::io::{Cursor, Write};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-pub trait IntoFrame {
-    fn into_frame(&self) -> Frame;
+pub trait AsFrame {
+    fn as_frame(&self) -> Frame;
 }
 
 /// An enum for RESP frame

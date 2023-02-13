@@ -1,7 +1,7 @@
 use super::Result;
 use crate::client::Error;
 use crate::cmd::{Del, Get, Ping, ResponseParser, Set};
-use crate::resp::{Connection, ConnectionPool, Connector, Frame, IntoFrame, Parser};
+use crate::resp::{AsFrame, Connection, ConnectionPool, Connector, Frame, Parser};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, BufWriter};
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -84,10 +84,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin, T: Connector<Stream = S>> Client<T> {
     }
 
     /// Apply a command to client, and parse response
-    async fn apply_cmd<C: ResponseParser + IntoFrame>(&self, cmd: C) -> Result<C::Response> {
+    pub async fn apply_cmd<C: AsFrame + ResponseParser>(&self, cmd: C) -> Result<C::Response> {
         let mut conn = self.pool.connect().await?;
 
-        let frame = cmd.into_frame();
+        let frame = cmd.as_frame();
         debug!(cmd = ?frame);
 
         // Write frame into connection and flush

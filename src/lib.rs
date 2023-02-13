@@ -1,3 +1,4 @@
+mod cli;
 mod client;
 mod cmd;
 mod engine;

@@ -1,7 +1,8 @@
 use super::{Error, Frame, Parser, ResponseParser, Result};
-use crate::resp::IntoFrame;
+use crate::resp::AsFrame;
 use bytes::Bytes;
 
+pub const DEL_COMMAND_NAME: &str = "DEL";
 const DEL_DEFAULT_RESPONSE: &str = "OK";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -26,6 +27,7 @@ impl Del {
 
     /// Get reference of key
     #[inline]
+    #[allow(dead_code)]
     pub fn raw_key(&self) -> &[u8] {
         &self.key
     }
@@ -43,12 +45,12 @@ impl Del {
     }
 }
 
-impl IntoFrame for Del {
+impl AsFrame for Del {
     /// Transfer command to resp
     #[inline]
-    fn into_frame(&self) -> Frame {
+    fn as_frame(&self) -> Frame {
         Frame::Array(vec![
-            Frame::Simple("del".into()),
+            Frame::Simple(DEL_COMMAND_NAME.into()),
             Frame::Bulk(self.key.clone()),
         ])
     }

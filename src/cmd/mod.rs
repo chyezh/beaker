@@ -1,21 +1,18 @@
-use std::str::FromStr;
+use std::pin::Pin;
 
 use crate::resp::{Frame, Parser};
-mod error;
-pub use error::Error;
-
-mod get;
-pub use get::Get;
-
-mod ping;
-pub use ping::Ping;
-
-mod set;
-pub use set::Set;
 
 mod del;
-pub use del::Del;
+mod error;
+mod get;
+mod ping;
+mod set;
 
+pub use del::{Del, DEL_COMMAND_NAME};
+pub use error::Error;
+pub use get::{Get, GET_COMMAND_NAME};
+pub use ping::{Ping, PING_COMMAND_NAME};
+pub use set::{Set, SET_COMMAND_NAME};
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -31,13 +28,13 @@ impl Command {
     pub fn from_frame(data: std::vec::IntoIter<Frame>) -> Result<Command> {
         let mut parser = Parser::new(data);
 
-        let command_name = parser.next_string()?.to_lowercase();
+        let command_name = parser.next_string()?.to_uppercase();
 
         let cmd = match command_name.as_str() {
-            "get" => Command::Get(Get::from_parser(&mut parser)?),
-            "ping" => Command::Ping(Ping::from_parser(&mut parser)?),
-            "set" => Command::Set(Set::from_parser(&mut parser)?),
-            "del" => Command::Del(Del::from_parser(&mut parser)?),
+            GET_COMMAND_NAME => Get::from_parser(&mut parser)?.into(),
+            PING_COMMAND_NAME => Ping::from_parser(&mut parser)?.into(),
+            SET_COMMAND_NAME => Set::from_parser(&mut parser)?.into(),
+            DEL_COMMAND_NAME => Del::from_parser(&mut parser)?.into(),
             _ => return Err(Error::UnexpectedCommandType),
         };
         parser.check_finish()?;
@@ -46,25 +43,36 @@ impl Command {
     }
 }
 
-impl FromStr for Command {
-    type Err = Error;
-
-    // Convert string from terminal input into command struct
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let s = s.trim_start();
-
-        let (command_name, remain) = if let Some((cmd, content)) = s.split_once(' ') {
-            (cmd, content)
-        } else {
-            (s, "")
-        };
-
-        todo!()
-    }
-}
-
 pub trait ResponseParser {
     type Response;
 
     fn parse_response(&self, parser: &mut Parser) -> Result<Self::Response>;
+}
+
+/// Implement transformation from underlying command
+impl From<Get> for Command {
+    fn from(value: Get) -> Self {
+        Self::Get(value)
+    }
+}
+
+/// Implement transformation from underlying command
+impl From<Ping> for Command {
+    fn from(value: Ping) -> Self {
+        Self::Ping(value)
+    }
+}
+
+/// Implement transformation from underlying command
+impl From<Del> for Command {
+    fn from(value: Del) -> Self {
+        Self::Del(value)
+    }
+}
+
+/// Implement transformation from underlying command
+impl From<Set> for Command {
+    fn from(value: Set) -> Self {
+        Self::Set(value)
+    }
 }

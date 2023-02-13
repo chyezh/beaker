@@ -1,6 +1,8 @@
 use super::{Frame, Parser, ResponseParser, Result};
-use crate::resp::IntoFrame;
+use crate::resp::AsFrame;
 use bytes::Bytes;
+
+pub const GET_COMMAND_NAME: &str = "GET";
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Get {
@@ -30,6 +32,7 @@ impl Get {
 
     /// Get owned key
     #[inline]
+    #[allow(dead_code)]
     pub fn key(&self) -> Bytes {
         self.key.clone()
     }
@@ -44,12 +47,12 @@ impl Get {
     }
 }
 
-impl IntoFrame for Get {
+impl AsFrame for Get {
     /// Transfer command to resp
     #[inline]
-    fn into_frame(&self) -> Frame {
+    fn as_frame(&self) -> Frame {
         Frame::Array(vec![
-            Frame::Simple("get".into()),
+            Frame::Simple(GET_COMMAND_NAME.into()),
             Frame::Bulk(self.key.clone()),
         ])
     }

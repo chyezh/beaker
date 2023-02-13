@@ -1,8 +1,9 @@
-use crate::resp::IntoFrame;
+use crate::resp::AsFrame;
 
 use super::{Error, Frame, Parser, ResponseParser, Result};
 use bytes::Bytes;
 
+pub const SET_COMMAND_NAME: &str = "SET";
 const SET_DEFAULT_RESPONSE: &str = "OK";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,12 +30,14 @@ impl Set {
 
     /// Get reference of key
     #[inline]
+    #[allow(dead_code)]
     pub fn raw_key(&self) -> &[u8] {
         &self.key
     }
 
     /// Get reference of val
     #[inline]
+    #[allow(dead_code)]
     pub fn raw_val(&self) -> &[u8] {
         &self.val
     }
@@ -58,12 +61,12 @@ impl Set {
     }
 }
 
-impl IntoFrame for Set {
+impl AsFrame for Set {
     /// Transfer command to resp
     #[inline]
-    fn into_frame(&self) -> Frame {
+    fn as_frame(&self) -> Frame {
         Frame::Array(vec![
-            Frame::Simple("set".into()),
+            Frame::Simple(SET_COMMAND_NAME.into()),
             Frame::Bulk(self.key.clone()),
             Frame::Bulk(self.val.clone()),
         ])

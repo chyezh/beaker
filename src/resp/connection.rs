@@ -6,7 +6,6 @@ use std::io::Cursor;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::debug;
 
 type Conns<T> = Arc<Mutex<Vec<Connection<T>>>>;
 

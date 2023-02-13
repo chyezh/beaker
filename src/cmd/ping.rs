@@ -1,7 +1,8 @@
 use super::{Error, Frame, Parser, ResponseParser, Result};
-use crate::resp::IntoFrame;
+use crate::resp::AsFrame;
 use bytes::Bytes;
 
+pub const PING_COMMAND_NAME: &str = "PING";
 const PING_DEFAULT_RESPONSE: &str = "PONG";
 
 #[derive(Debug, Eq, PartialEq, Default)]
@@ -36,10 +37,10 @@ impl Ping {
     }
 }
 
-impl IntoFrame for Ping {
+impl AsFrame for Ping {
     /// Transfer command to resp
-    fn into_frame(&self) -> Frame {
-        let mut frame = Frame::Array(vec!["ping".to_string().into()]);
+    fn as_frame(&self) -> Frame {
+        let mut frame = Frame::Array(vec![PING_COMMAND_NAME.to_string().into()]);
         if let Some(msg) = &self.msg {
             frame.push_bulk(msg.clone());
         }
