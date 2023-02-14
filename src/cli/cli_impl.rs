@@ -28,8 +28,16 @@ impl Default for Cli {
 impl Cli {
     /// Run this cli tool
     pub async fn run(&self) -> Result<()> {
-        let client = Client::connect(self.args.addr()).await?;
+        if self.is_terminal {
+            self.run_in_terminal().await
+        } else {
+            self.run_not_in_terminal().await
+        }
+    }
 
+    /// Run in terminal
+    async fn run_in_terminal(&self) -> Result<()> {
+        let client = Client::connect(self.args.addr()).await?;
         let mut input = String::new();
 
         loop {
@@ -50,6 +58,31 @@ impl Cli {
             }
             io::stdout().flush().unwrap();
         }
+
+        Ok(())
+    }
+
+    /// Run not in terminal
+    async fn run_not_in_terminal(&self) -> Result<()> {
+        let client = Client::connect(self.args.addr()).await?;
+        let mut input = String::new();
+
+        loop {
+            input.clear();
+            if io::stdin().read_line(&mut input)? == 0 {
+                break;
+            }
+            match parse(&input) {
+                Ok(cmd) => match self.apply_cmd(&client, cmd).await {
+                    Ok(msg) => println!("{}", msg),
+                    Err(e) => println!("{:?}", e),
+                },
+                Err(e) => {
+                    println!("{:?}", e);
+                }
+            }
+        }
+        io::stdout().flush().unwrap();
 
         Ok(())
     }
