@@ -3,6 +3,7 @@ mod compact;
 mod db;
 mod error;
 mod event;
+mod kvtable;
 mod manifest;
 mod memtable;
 mod record;

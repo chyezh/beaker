@@ -57,8 +57,8 @@ impl DB {
         // Get memtable first
         if let Some(value) = self.memtable.get(key) {
             match value {
-                Value::Living(v) => return Ok(Some(v)),
-                Value::Tombstone => return Ok(None),
+                Value::Living(v) | Value::LivingMeta(v, _) => return Ok(Some(v)),
+                Value::Tombstone | Value::TombstoneMeta(_) => return Ok(None),
             }
         }
 
@@ -68,8 +68,8 @@ impl DB {
             let table = self.manager.open(entry).await?;
             if let Some(value) = table.search(key).await? {
                 match value {
-                    Value::Living(v) => return Ok(Some(v)),
-                    Value::Tombstone => return Ok(None),
+                    Value::Living(v) | Value::LivingMeta(v, _) => return Ok(Some(v)),
+                    Value::Tombstone | Value::TombstoneMeta(_) => return Ok(None),
                 }
             }
         }
@@ -78,13 +78,13 @@ impl DB {
         Ok(None)
     }
 
-    // Set key value pair into db
-    pub fn set(&self, key: Bytes, value: Bytes) -> Result<()> {
+    // Set key value pair into db and return log_id of the write operation
+    pub fn set(&self, key: Bytes, value: Bytes) -> Result<u64> {
         self.memtable.set(key, Value::Living(value))
     }
 
-    // Delete value by key
-    pub fn del(&self, key: Bytes) -> Result<()> {
+    // Delete value by key and return log_id of the write operation
+    pub fn del(&self, key: Bytes) -> Result<u64> {
         self.memtable.set(key, Value::Tombstone)
     }
 

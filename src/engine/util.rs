@@ -1,12 +1,17 @@
-use bytes::Bytes;
-use std::io::Write;
-
 use super::{Error, Result};
+use crate::util::from_le_bytes_32;
+use bytes::Bytes;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+const LIVING_META_VALUE_TYPE: u8 = 3;
+const TOMBSTONE_META_VALUE_TYPE: u8 = 2;
 const LIVING_VALUE_TYPE: u8 = 1;
 const TOMBSTONE_VALUE_TYPE: u8 = 0;
+
+const LIVING_META_VALUE_TYPE_HEADER: usize = 5;
+const OTHER_VALUE_TYPE_HEADER: usize = 1;
 
 // LSM-Tree value
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -15,6 +20,11 @@ pub enum Value {
 
     // Deleted value
     Tombstone,
+
+    // Meta data is promised to live on log, but not on sstable
+    LivingMeta(Bytes, Bytes),
+
+    TombstoneMeta(Bytes),
 }
 
 impl Value {
@@ -33,12 +43,29 @@ impl Value {
         }
 
         match data[0] {
-            LIVING_VALUE_TYPE => Ok(Value::Living(data.slice(1..))),
+            LIVING_VALUE_TYPE => Ok(Self::Living(data.slice(OTHER_VALUE_TYPE_HEADER..))),
             TOMBSTONE_VALUE_TYPE => {
-                if data.len() != 1 {
+                if data.len() != OTHER_VALUE_TYPE_HEADER {
                     return Err(Error::IllegalValueBinary);
                 }
-                Ok(Value::Tombstone)
+                Ok(Self::Tombstone)
+            }
+            TOMBSTONE_META_VALUE_TYPE => {
+                Ok(Self::TombstoneMeta(data.slice(OTHER_VALUE_TYPE_HEADER..)))
+            }
+            LIVING_META_VALUE_TYPE => {
+                if data.len() < LIVING_META_VALUE_TYPE_HEADER {
+                    return Err(Error::IllegalValueBinary);
+                }
+                let data_len = from_le_bytes_32(&data[1..5]);
+                let meta_begin = data_len + LIVING_META_VALUE_TYPE_HEADER;
+                if data.len() < meta_begin {
+                    return Err(Error::IllegalValueBinary);
+                }
+                Ok(Self::LivingMeta(
+                    data.slice(LIVING_META_VALUE_TYPE_HEADER..meta_begin),
+                    data.slice(meta_begin..),
+                ))
             }
             _ => Err(Error::IllegalValueBinary),
         }
@@ -48,18 +75,32 @@ impl Value {
     #[inline]
     pub fn encode_bytes_len(&self) -> usize {
         match self {
-            Value::Tombstone => 1,
-            Value::Living(bytes) => 1 + bytes.len(),
+            Self::Tombstone => OTHER_VALUE_TYPE_HEADER,
+            Self::Living(bytes) => OTHER_VALUE_TYPE_HEADER + bytes.len(),
+            Self::TombstoneMeta(meta) => OTHER_VALUE_TYPE_HEADER + meta.len(),
+            Self::LivingMeta(bytes, meta) => {
+                LIVING_META_VALUE_TYPE_HEADER + bytes.len() + meta.len()
+            }
         }
     }
 
     // Encode into bytes and write to given Write
     pub fn encode_to<W: Write>(&self, mut w: W) -> Result<()> {
         match self {
-            Value::Tombstone => w.write_all(&[TOMBSTONE_VALUE_TYPE])?,
-            Value::Living(data) => {
+            Self::Tombstone => w.write_all(&[TOMBSTONE_VALUE_TYPE])?,
+            Self::Living(data) => {
                 w.write_all(&[LIVING_VALUE_TYPE])?;
                 w.write_all(&data[..])?;
+            }
+            Self::TombstoneMeta(meta) => {
+                w.write_all(&[TOMBSTONE_META_VALUE_TYPE])?;
+                w.write_all(&meta[..])?;
+            }
+            Self::LivingMeta(data, meta) => {
+                w.write_all(&[LIVING_META_VALUE_TYPE])?;
+                w.write_all(&data.len().to_le_bytes()[0..4])?;
+                w.write_all(data)?;
+                w.write_all(meta)?;
             }
         };
         Ok(())
@@ -67,7 +108,7 @@ impl Value {
 
     #[inline]
     pub fn is_tombstone(&self) -> bool {
-        matches!(self, Value::Tombstone)
+        matches!(self, Self::Tombstone | Self::TombstoneMeta(_))
     }
 }
 

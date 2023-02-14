@@ -1,9 +1,6 @@
 use super::{
-    compact::Compactor,
-    manifest::Manifest,
-    memtable::{KVTable, MemTable},
-    sstable::SSTableManager,
-    Error, Result,
+    compact::Compactor, kvtable::KVTable, manifest::Manifest, memtable::MemTable,
+    sstable::SSTableManager, Error, Result,
 };
 use crate::util::shutdown::Listener;
 use std::{
