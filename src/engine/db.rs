@@ -93,7 +93,7 @@ impl DB {
         info!("shutdown DB...");
         let mut shutdown = self.shutdown.lock().take().unwrap();
         shutdown.notify().await;
-        info!("shutdown DB complete");
+        info!("DB shutdown");
     }
 }
 

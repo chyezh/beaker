@@ -1,5 +1,5 @@
 use tokio::sync::{mpsc, watch};
-use tracing::info;
+use tracing::debug;
 
 // Shutdown notifier and waiting for application part to graceful shutdown
 pub struct Notifier {
@@ -22,11 +22,12 @@ impl Notifier {
 
     // Notify shutdown signal and block util all listener finish its task
     pub async fn notify(&mut self) {
-        info!("shutdown notifying...");
-        self.sender.send(true).unwrap();
+        debug!("shutdown notifying...");
+        // It's ok if send failed, there's no listener working
+        self.sender.send(true).ok();
         self.waiter.0.take();
         self.waiter.1.recv().await;
-        info!("shutdown complete");
+        debug!("shutdown complete");
     }
 
     // Create a shutdown signal listener
