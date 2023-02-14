@@ -17,7 +17,7 @@ impl<T> TcpStreamConnector<T> {
     }
 }
 
-#[async_trait::async_trait]
+#[tonic::async_trait]
 impl<T: ToSocketAddrs + Send + Sync> Connector for TcpStreamConnector<T> {
     type Stream = BufWriter<TcpStream>;
 

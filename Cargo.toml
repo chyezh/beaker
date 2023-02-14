@@ -17,7 +17,6 @@ tokio = { version = "1.0", features = [
     "signal",
 ] }
 async-stream = { version = "0.3.3" }
-async-trait = { version = "0.1.64" }
 futures-core = { version = "0.3.25" }
 futures-util = { version = "0.3.25" }
 anyhow = { version = "1.0.66" }

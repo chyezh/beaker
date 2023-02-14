@@ -83,7 +83,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
 }
 
 /// An interface for creating a connection
-#[async_trait::async_trait]
+#[tonic::async_trait]
 pub trait Connector {
     type Stream;
 
