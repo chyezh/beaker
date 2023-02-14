@@ -1,5 +1,3 @@
-use std::pin::Pin;
-
 use crate::resp::{Frame, Parser};
 
 mod del;

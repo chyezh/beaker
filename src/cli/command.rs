@@ -1,4 +1,4 @@
-use super::{Error, Result};
+use super::{error::Error, Result};
 use crate::cmd::{
     Command, Del, Get, Ping, Set, DEL_COMMAND_NAME, GET_COMMAND_NAME, PING_COMMAND_NAME,
     SET_COMMAND_NAME,

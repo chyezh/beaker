@@ -1,6 +1,6 @@
 use super::Result;
 use crate::client::Error;
-use crate::cmd::{Command, Del, Get, Ping, ResponseParser, Set};
+use crate::cmd::{Del, Get, Ping, ResponseParser, Set};
 use crate::resp::{AsFrame, Connection, ConnectionPool, Connector, Frame, Parser};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, BufWriter};

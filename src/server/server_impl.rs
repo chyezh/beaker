@@ -1,24 +1,32 @@
+use clap::Parser;
 use tokio::io::BufWriter;
-use tokio::net::{TcpListener, ToSocketAddrs};
+use tokio::net::TcpListener;
 
+use super::argument::Args;
 use super::{handler::Handler, Result};
 use crate::engine::DB;
 use crate::resp::Connection;
 use tracing::warn;
 
 pub struct Server {
+    args: Args,
     db: DB,
 }
 
-impl Server {
-    // Create a new Server with given engine
-    pub fn new(db: DB) -> Self {
-        Server { db }
-    }
+impl Default for Server {
+    fn default() -> Self {
+        let args = Args::parse();
+        // Open database
+        let db = DB::open(args.root_path()).unwrap();
 
+        Server { args, db }
+    }
+}
+
+impl Server {
     // Run the server
-    pub async fn run<T: ToSocketAddrs>(self, addr: T) -> Result<()> {
-        let listener = TcpListener::bind(addr).await?;
+    pub async fn run(self) -> Result<()> {
+        let listener = TcpListener::bind(self.args.addr()).await?;
 
         loop {
             // Accept a new stream and construct a new task to run concurrently
