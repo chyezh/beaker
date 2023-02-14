@@ -11,4 +11,7 @@ pub enum Error {
 
     #[error(transparent)]
     Cmd(#[from] crate::cmd::Error),
+
+    #[error("unexpected RESP data frame")]
+    UnexpectedDataFrame,
 }
