@@ -48,7 +48,7 @@ impl Config {
 
     #[inline]
     pub fn log_path(&self) -> PathBuf {
-        self.root_path.join("log")
+        self.root_path.clone()
     }
 }
 
@@ -82,6 +82,7 @@ impl Default for Timer {
 pub struct Initial {
     pub event_sender: EventNotifier,
     pub sstable_manager: SSTableManager<tokio::fs::File>,
+    pub max_log_id: Option<u64>,
 }
 
 impl Initial {
@@ -93,6 +94,7 @@ impl Initial {
             Initial {
                 event_sender,
                 sstable_manager: manager,
+                max_log_id: None,
             },
             event_builder,
         )

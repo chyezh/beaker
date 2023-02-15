@@ -12,7 +12,8 @@ use futures_core::Future;
 use parking_lot::{Mutex, RwLock};
 use std::{
     fs::{self, File, OpenOptions},
-    path::Path,
+    io::{Seek, SeekFrom},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -52,11 +53,25 @@ impl MemTable {
 
             // Recover immutable memtable
             for (path, seq_id) in log_files.iter() {
-                // Recover a new memtable from a log file
-                if let Some(table) = recover_log(path, *seq_id, last_log_id)? {
-                    // Old tables never write new entry
-                    let immutable_table = Arc::new(table);
-                    tables.push(Arc::clone(&immutable_table));
+                match recover_log(path, *seq_id, last_log_id, initial.max_log_id)? {
+                    (Some(table), None) => {
+                        // Old tables never write new entry
+                        last_log_id = table.log_id_range().1;
+                        let immutable_table = Arc::new(table);
+                        tables.push(Arc::clone(&immutable_table));
+                    }
+                    (Some(table), Some(writer)) => {
+                        // Recover part of log, and continue write log after the part.
+                        return Ok(MemTable {
+                            mutable: Arc::new(Mutex::new((table, writer))),
+                            immutable: Arc::new(RwLock::new(tables)),
+                            next_log_seq: Arc::new(AtomicU64::new(*seq_id + 1)),
+                            dump_mutex: Arc::new(tokio::sync::Mutex::new(())),
+                            config,
+                            initial,
+                        });
+                    }
+                    _ => continue,
                 }
             }
             (tables, log_files.last().unwrap().1)
@@ -120,8 +135,11 @@ impl MemTable {
             let new_log_seq = self.next_log_seq.fetch_add(1, Ordering::Relaxed);
 
             // Create a new writer
-            let mut new_mutable =
-                open_new_log(&self.config.root_path, new_log_seq, mutable.0.next_log_id())?;
+            let mut new_mutable = open_new_log(
+                &self.config.log_path(),
+                new_log_seq,
+                mutable.0.next_log_id(),
+            )?;
 
             // Swap mutable, close writer, and convert old mutable into immutable
             std::mem::swap(&mut *mutable, &mut new_mutable);
@@ -211,37 +229,84 @@ impl MemTable {
 }
 
 /// Recover a table from given log sequence id
-fn recover_log(path: &Path, seq_id: u64, mut last_log_id: u64) -> Result<Option<KVTable>> {
-    let reader = RecordReader::new(File::open(path)?);
-    let mut table = None;
+///
+/// Return KVTable if table is not empty.
+///
+/// Return RecordWriter if recover operation reaches the target_log_id,
+/// RecordWriter will continue append new log after the log of target_log_id,
+///
+/// Return Err(TargetLogIdConsumed) if given target log id was unrecoverable,
+/// because of sstable dump operation.
+fn recover_log(
+    path: &Path,
+    seq_id: u64,
+    mut last_log_id: u64,
+    target_log_id: Option<u64>,
+) -> Result<(Option<KVTable>, Option<RecordWriter<File>>)> {
+    let mut reader = RecordReader::new(File::open(path)?);
 
-    for data in reader {
+    if let Some(data) = reader.next() {
         let (log_id, key, value) = decode_kv(data?)?;
-        // Initialize log id
-        if last_log_id == 0 {
-            last_log_id = log_id;
-        } else {
-            last_log_id += 1;
+
+        // Update and check last log id, log_id should be keep increasing step by one
+        last_log_id = update_last_log_id(last_log_id, log_id)?;
+
+        // Check if target_log_id was consumed
+        if matches!(target_log_id, Some(id) if id < log_id) {
+            return Err(Error::TargetLogIdConsumed);
         }
 
-        // Check log_id consistency
-        if last_log_id != log_id {
-            Err(Error::InconsistentLogId)?;
+        // Initialize kvtable at first iteration
+        let mut table = KVTable::new(seq_id, last_log_id);
+        table.set(key, value);
+
+        // Reach the target log id, return sstable and log writer at this record point
+        if Some(log_id) == target_log_id {
+            let (block_offset, total_offset) = reader.offset()?;
+            let writer = open_exist_log_at_offset(path, block_offset, total_offset)?;
+            return Ok((Some(table), Some(writer)));
         }
 
-        if table.is_none() {
-            table = Some(KVTable::new(seq_id, last_log_id));
+        // Build new kvtable from reader
+        while let Some(data) = reader.next() {
+            let (log_id, key, value) = decode_kv(data?)?;
+            last_log_id = update_last_log_id(last_log_id, log_id)?;
+
+            table.set(key, value);
+
+            debug_assert_eq!(last_log_id, table.log_id_range().1);
+            debug_assert!(
+                target_log_id.is_none() || matches!(target_log_id, Some(id) if log_id <= id)
+            );
+
+            // Reach the target log id, return sstable and log writer at this record point
+            if Some(log_id) == target_log_id {
+                let (block_offset, total_offset) = reader.offset()?;
+                let writer = open_exist_log_at_offset(path, block_offset, total_offset)?;
+                return Ok((Some(table), Some(writer)));
+            }
         }
-        table.as_mut().unwrap().set(key, value);
+
+        return Ok((Some(table), None));
     }
 
-    // Skip empty table
-    if table.is_none() || table.as_ref().unwrap().is_empty() {
-        return Ok(None);
-    }
-    debug_assert_eq!(last_log_id, table.as_ref().unwrap().log_id_range().1);
+    Ok((None, None))
+}
 
-    Ok(table)
+/// Check last log id, log_id should be keep increasing step by one
+fn update_last_log_id(mut last_log_id: u64, log_id: u64) -> Result<u64> {
+    if last_log_id == 0 {
+        // Initialize last log id if last log id is not set up
+        last_log_id = log_id;
+    } else {
+        last_log_id += 1;
+    }
+
+    if last_log_id != log_id {
+        return Err(Error::InconsistentLogId);
+    }
+
+    Ok(last_log_id)
 }
 
 // Encode the KV pair into binary format. While no checksum is applied on here, record writer downside has promised. Layout:
@@ -282,9 +347,9 @@ fn decode_kv(data: Bytes) -> Result<(u64, Bytes, Value)> {
     Ok((log_id, key, value))
 }
 
-// Open a new log with given log sequence number
+/// Open a new log with given log sequence number
 fn open_new_log(dir: &Path, log_seq: u64, log_id: u64) -> Result<(KVTable, RecordWriter<File>)> {
-    let new_log_path = dir.join(format!("{}.{}", log_seq, LOG_FILE_EXTENSION));
+    let new_log_path = log_path(dir, log_seq);
 
     let new_file = OpenOptions::new()
         .truncate(true)
@@ -296,21 +361,94 @@ fn open_new_log(dir: &Path, log_seq: u64, log_id: u64) -> Result<(KVTable, Recor
     Ok((table, RecordWriter::new(new_file)))
 }
 
+/// Open exist log at given seek offset from beginning.
+fn open_exist_log_at_offset(
+    log_path: &Path,
+    block_offset: usize,
+    total_offset: usize,
+) -> Result<RecordWriter<File>> {
+    let mut new_file = OpenOptions::new().write(true).open(log_path)?;
+    // Truncate the file and seek to offset
+    new_file.seek(SeekFrom::Start(total_offset as u64))?;
+    new_file.set_len(total_offset as u64)?;
+
+    RecordWriter::recover(new_file, block_offset, total_offset)
+}
+
+#[inline]
+fn log_path(dir: &Path, log_seq: u64) -> PathBuf {
+    dir.join(format!("{}.{}", log_seq, LOG_FILE_EXTENSION))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::test_case::generate_random_bytes;
+    use crate::util::test_case::{generate_random_bytes, generate_step_by_bytes};
     use core::panic;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_log_part_log_recover() {
+        let temp_dir = tempdir().unwrap();
+        let root_path = temp_dir.path();
+
+        let test_count = 10000;
+        let test_case_key = generate_step_by_bytes(test_count);
+        let test_case_value = generate_random_bytes(test_count, 32 * 10 * 1024);
+
+        let config = Config::default_config_with_path(root_path.to_path_buf());
+        let (mut initial, _event_builder) = Initial::new();
+
+        // Create case
+        let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
+        for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
+            memtable
+                .set(key.clone(), Value::Living(value.clone()))
+                .unwrap();
+        }
+        drop(memtable);
+
+        // Recover part twice
+        for recover_count in [1, test_count / 3, test_count / 2, test_count] {
+            // Recover half of test
+            initial.max_log_id = Some(recover_count as u64);
+            let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
+            for (offset, (key, value)) in
+                test_case_key.iter().zip(test_case_value.iter()).enumerate()
+            {
+                let v = memtable.get(key);
+                if offset < recover_count {
+                    assert_eq!(v, Some(Value::Living(value.clone())));
+                } else {
+                    assert_eq!(v, None);
+                }
+            }
+
+            // Continue to set rest kv pair
+            for (key, value) in test_case_key
+                .iter()
+                .zip(test_case_value.iter())
+                .skip(recover_count)
+            {
+                memtable
+                    .set(key.clone(), Value::Living(value.clone()))
+                    .unwrap();
+            }
+            for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
+                let v = memtable.get(key);
+                assert_eq!(v, Some(Value::Living(value.clone())));
+            }
+        }
+    }
 
     #[test]
     fn test_log_with_random_case() {
         let temp_dir = tempdir().unwrap();
         let root_path = temp_dir.path();
-        let test_count = 100;
+        let test_count = 1000;
 
-        let test_case_key = generate_random_bytes(test_count, 10000);
-        let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
+        let test_case_key = generate_step_by_bytes(test_count);
+        let test_case_value = generate_random_bytes(test_count, 32 * 10 * 1024);
 
         let config = Config::default_config_with_path(root_path.to_path_buf());
         let (initial, _event_builder) = Initial::new();

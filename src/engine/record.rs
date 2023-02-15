@@ -7,12 +7,10 @@
 //    type: uint8          // One of FULL, FIRST, MIDDLE, LAST
 //    data: uint8[length]
 
-use crate::util::{checksum, from_le_bytes_32, read_exact};
-
 use super::{Error, Result};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-
+use crate::util::{checksum, from_le_bytes_32, read_exact};
 use bytes::{Buf, Bytes};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 const RECORD_BLOCK_SIZE: usize = 32 * 1024; // 32kb for every block
 const RECORD_HEADER_SIZE: usize = 1 + 2 + 4; // record_type + record_len + record_checksum
@@ -51,24 +49,22 @@ pub struct RecordReader<R: Read + Seek> {
 
 impl<R: Read + Seek> RecordReader<R> {
     pub fn new(reader: R) -> Self {
-        let mut r = RecordReader {
+        RecordReader {
             reader,
             buffer: Vec::with_capacity(RECORD_BLOCK_SIZE),
             offset: 0,
-        };
-        r.buffer.resize(RECORD_BLOCK_SIZE, b'\x00');
-        r.offset = r.buffer.len();
-
-        // buffer size mut be RECORD_BLOCK_SIZE
-        debug_assert_eq!(r.buffer.len(), RECORD_BLOCK_SIZE);
-        r
+        }
     }
 
-    /// Get total offset has been iterated
+    /// Get total offset and block offset has been iterated
     #[inline]
-    pub fn offset(&mut self) -> Result<u64> {
+    pub fn offset(&mut self) -> Result<(usize, usize)> {
         let seek_offset = self.reader.seek(SeekFrom::Current(0))?;
-        Ok(seek_offset + self.offset as u64)
+        // Part of data already read in buffer
+        Ok((
+            self.offset,
+            seek_offset as usize - (self.buffer.len() - self.offset),
+        ))
     }
 
     // Parse a new record, act as a cursor
@@ -76,6 +72,9 @@ impl<R: Read + Seek> RecordReader<R> {
         debug_assert!(self.offset <= self.buffer.len());
         if self.buffer.len() - self.offset < RECORD_HEADER_SIZE {
             // Skip the empty tailer of block and fill the buffer
+
+            // Set buffer size to RECORD_BLOCK_SIZE before read
+            self.buffer.resize(RECORD_BLOCK_SIZE, b'\x00');
             read_exact(&mut self.reader, &mut self.buffer)?;
             self.offset = 0;
 
@@ -190,6 +189,16 @@ pub struct RecordWriter<W: Write> {
 }
 
 impl<W: Write> RecordWriter<W> {
+    /// Recover from half record file
+    pub fn recover(file: W, block_offset: usize, total_written: usize) -> Result<Self> {
+        Ok(RecordWriter {
+            writer: file,
+            block_offset,
+            total_written,
+        })
+    }
+
+    /// Create a new record writer
     pub fn new(file: W) -> Self {
         RecordWriter {
             writer: file,
@@ -298,7 +307,50 @@ impl<W: Write> RecordWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::test_case::generate_random_bytes;
+    use crate::util::test_case::{generate_random_bytes, generate_step_by_bytes};
+
+    #[test]
+    fn test_read_offset() {
+        // let test_case = generate_random_bytes(1000, 10 * RECORD_BLOCK_SIZE);
+        let test_case = generate_step_by_bytes(10000);
+        // write to buffer
+        let v = Vec::new();
+        let mut w = RecordWriter::new(v);
+        for bytes in test_case.iter() {
+            assert!(w.append(bytes.clone()).is_ok());
+        }
+
+        // Clone a new v and read part of this
+        let mut reader = RecordReader::new(Cursor::new(&w.writer[..]));
+        assert_eq!(reader.offset().unwrap(), (0, 0));
+        // Consume it and test if offset reaches end
+        for _ in reader.by_ref() {}
+        assert_eq!(reader.offset().unwrap(), (0, w.writer.len()));
+
+        // Test continue writing
+        let mut reader = RecordReader::new(Cursor::new(&w.writer[..]));
+        assert_eq!(reader.offset().unwrap(), (0, 0));
+        // Consume it and test if offset reaches end
+        reader.next();
+        let (block_offset, total_offset) = reader.offset().unwrap();
+
+        let mut v = w.writer.clone();
+        v.resize(total_offset, b'\x00');
+        let mut w2 = RecordWriter::recover(v, block_offset, total_offset).unwrap();
+        for bytes in test_case.iter().skip(1) {
+            assert!(w2.append(bytes.clone()).is_ok())
+        }
+
+        assert_eq!(w.writer.len(), w2.writer.len());
+        assert_eq!(
+            w.writer
+                .iter()
+                .zip(w2.writer.iter())
+                .filter(|(x1, x2)| x1 != x2)
+                .count(),
+            0
+        );
+    }
 
     #[test]
     fn test_read_writer_with_random_case() {
