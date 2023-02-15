@@ -12,7 +12,7 @@ use futures_core::Future;
 use parking_lot::{Mutex, RwLock};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Seek, SeekFrom},
+    io::{BufWriter, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},

@@ -10,7 +10,10 @@
 use super::{Error, Result};
 use crate::util::{checksum, from_le_bytes_32, read_exact};
 use bytes::{Buf, Bytes};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::{
+    fmt::Debug,
+    io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write},
+};
 
 const RECORD_BLOCK_SIZE: usize = 32 * 1024; // 32kb for every block
 const RECORD_HEADER_SIZE: usize = 1 + 2 + 4; // record_type + record_len + record_checksum
@@ -183,7 +186,7 @@ impl<R: Read + Seek> Iterator for RecordReader<R> {
 // Implement a binary log Writer
 #[derive(Debug)]
 pub struct RecordWriter<W: Write> {
-    writer: W,
+    writer: BufWriter<W>,
     block_offset: usize,
     total_written: usize,
 }
@@ -192,7 +195,7 @@ impl<W: Write> RecordWriter<W> {
     /// Recover from half record file
     pub fn recover(file: W, block_offset: usize, total_written: usize) -> Result<Self> {
         Ok(RecordWriter {
-            writer: file,
+            writer: BufWriter::new(file),
             block_offset,
             total_written,
         })
@@ -201,7 +204,7 @@ impl<W: Write> RecordWriter<W> {
     /// Create a new record writer
     pub fn new(file: W) -> Self {
         RecordWriter {
-            writer: file,
+            writer: BufWriter::new(file),
             block_offset: 0,
             total_written: 0,
         }
@@ -304,48 +307,55 @@ impl<W: Write> RecordWriter<W> {
     }
 }
 
+impl<W: Write + Debug> RecordWriter<W> {
+    #[cfg(test)]
+    fn into_inner(self) -> W {
+        self.writer.into_inner().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::test_case::{generate_random_bytes, generate_step_by_bytes};
+    use crate::util::test_case::generate_random_bytes;
 
     #[test]
     fn test_read_offset() {
-        // let test_case = generate_random_bytes(1000, 10 * RECORD_BLOCK_SIZE);
-        let test_case = generate_step_by_bytes(10000);
+        let test_case = generate_random_bytes(1000, 10 * RECORD_BLOCK_SIZE);
         // write to buffer
         let v = Vec::new();
         let mut w = RecordWriter::new(v);
         for bytes in test_case.iter() {
             assert!(w.append(bytes.clone()).is_ok());
         }
+        let log = w.into_inner();
 
         // Clone a new v and read part of this
-        let mut reader = RecordReader::new(Cursor::new(&w.writer[..]));
+        let mut reader = RecordReader::new(Cursor::new(&log));
         assert_eq!(reader.offset().unwrap(), (0, 0));
         // Consume it and test if offset reaches end
         for _ in reader.by_ref() {}
-        assert_eq!(reader.offset().unwrap(), (0, w.writer.len()));
+        assert_eq!(reader.offset().unwrap(), (0, log.len()));
 
         // Test continue writing
-        let mut reader = RecordReader::new(Cursor::new(&w.writer[..]));
+        let mut reader = RecordReader::new(Cursor::new(&log));
         assert_eq!(reader.offset().unwrap(), (0, 0));
         // Consume it and test if offset reaches end
         reader.next();
         let (block_offset, total_offset) = reader.offset().unwrap();
 
-        let mut v = w.writer.clone();
+        let mut v = log.clone();
         v.resize(total_offset, b'\x00');
-        let mut w2 = RecordWriter::recover(v, block_offset, total_offset).unwrap();
+        let mut w = RecordWriter::recover(v, block_offset, total_offset).unwrap();
         for bytes in test_case.iter().skip(1) {
-            assert!(w2.append(bytes.clone()).is_ok())
+            assert!(w.append(bytes.clone()).is_ok())
         }
+        let log2 = w.into_inner();
 
-        assert_eq!(w.writer.len(), w2.writer.len());
+        assert_eq!(log2.len(), log.len());
         assert_eq!(
-            w.writer
-                .iter()
-                .zip(w2.writer.iter())
+            log2.iter()
+                .zip(log.iter())
                 .filter(|(x1, x2)| x1 != x2)
                 .count(),
             0
@@ -362,9 +372,10 @@ mod tests {
         for bytes in test_case.iter() {
             assert!(w.append(bytes.clone()).is_ok());
         }
+        let log = w.into_inner();
 
         // test complete size
-        let v = Cursor::new(&w.writer[..]);
+        let v = Cursor::new(&log);
         let r = RecordReader::new(v);
         let mut total = 0;
         for (idx, elem) in r.enumerate() {
@@ -374,7 +385,7 @@ mod tests {
         assert_eq!(total, test_case.len());
 
         // test tail lost case
-        let v = Cursor::new(&w.writer[0..&w.writer.len() - 7]);
+        let v = Cursor::new(&log[0..log.len() - 7]);
         let r = RecordReader::new(v);
 
         let mut total = 0;
