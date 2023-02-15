@@ -1,5 +1,4 @@
 use super::util::Value;
-use super::{Error, Result};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 

@@ -313,7 +313,7 @@ mod tests {
         let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
 
         let config = Config::default_config_with_path(root_path.to_path_buf());
-        let (initial, _event_builder) = Initial::initial();
+        let (initial, _event_builder) = Initial::new();
 
         // Test normal value
         let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
@@ -371,7 +371,7 @@ mod tests {
         }
 
         drop(memtable);
-        let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
+        let memtable = MemTable::open(config, initial).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             if let Some(Value::Living(v)) = memtable.get(key) {
                 assert_eq!(value, &v);

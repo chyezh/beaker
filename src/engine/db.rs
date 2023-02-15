@@ -18,7 +18,7 @@ impl DB {
     pub fn open(config: Config) -> Result<Self> {
         info!("open DB...");
         let shutdown = Notifier::new();
-        let (initial, event_builder) = Initial::initial();
+        let (initial, event_builder) = Initial::new();
 
         info!("open manifest...");
         let manifest = Manifest::open(config.clone(), initial.clone())?;
@@ -91,10 +91,7 @@ impl DB {
 mod tests {
     use super::{super::event::Event, *};
     use crate::{
-        engine::{
-            event::{EventMessage, EventNotifier},
-            manifest,
-        },
+        engine::event::{EventMessage, EventNotifier},
         util::shutdown::Notifier,
     };
     use rand::Rng;
@@ -423,11 +420,11 @@ mod tests {
         path: impl Into<PathBuf> + Copy,
     ) -> (DB, EventNotifier, UnboundedReceiver<EventMessage>) {
         // Disable timer
-        let mut config = Config::default_config_with_path(path.into());
+        let config = Config::default_config_with_path(path.into());
         let shutdown = Notifier::new();
 
         // Create a manually control event
-        let (mut initial, event_builder) = Initial::initial();
+        let (mut initial, event_builder) = Initial::new();
         let (fake_event_sender, _rx) = unbounded_channel();
         let mut fake_event_sender = EventNotifier::new(fake_event_sender);
         std::mem::swap(&mut initial.event_sender, &mut fake_event_sender);
@@ -441,7 +438,7 @@ mod tests {
             .memtable(memtable.clone())
             .manager(initial.sstable_manager.clone())
             .shutdown(shutdown.listen().unwrap())
-            .run(config.timer.clone());
+            .run(config.timer);
 
         let db = DB {
             manifest,

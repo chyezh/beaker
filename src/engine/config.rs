@@ -85,7 +85,8 @@ pub struct Initial {
 }
 
 impl Initial {
-    pub fn initial() -> (Self, EventLoopBuilder) {
+    /// Create a Initial
+    pub fn new() -> (Self, EventLoopBuilder) {
         let manager = SSTableManager::new();
         let (event_sender, event_builder) = EventLoopBuilder::new();
         (

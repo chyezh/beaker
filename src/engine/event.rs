@@ -89,7 +89,7 @@ impl EventLoopBuilder {
     }
 
     // Start a event loop
-    pub fn run(mut self, mut config: Timer) {
+    pub fn run(mut self, config: Timer) {
         assert!(self.manifest.is_some());
         assert!(self.memtable.is_some());
         assert!(self.shutdown.is_some());
