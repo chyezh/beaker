@@ -1,4 +1,5 @@
-use super::event::{Event, EventNotifier};
+use super::config::{Config, Initial};
+use super::event::Event;
 use super::record::RecordWriter;
 use super::sstable::{self, SSTableEntry, SSTableManager, SSTableRange};
 use super::util::scan_sorted_file_at_path;
@@ -171,28 +172,20 @@ impl ManifestPersister {
 pub struct Manifest {
     inner: Arc<RwLock<ManifestInner>>,
     persister: Arc<Mutex<ManifestPersister>>,
-    root_path: PathBuf,
-    event_sender: EventNotifier,
-    manager: SSTableManager<tokio::fs::File>,
+    config: Config,
+    initial: Initial,
 }
 
 impl Manifest {
     // Open a new manifest record
-    pub fn open(
-        root_path: impl Into<PathBuf>,
-        event_sender: EventNotifier,
-        manager: SSTableManager<tokio::fs::File>,
-    ) -> Result<Self> {
+    pub fn open(config: Config, initial: Initial) -> Result<Self> {
         // Try to create manifest root directory
-        let root_path: PathBuf = root_path.into();
-        fs::create_dir_all(sstable_root_path(&root_path))?;
-        fs::create_dir_all(manifest_root_path(&root_path))?;
+        fs::create_dir_all(config.sstable_path())?;
+        fs::create_dir_all(config.manifest_path())?;
 
         // Scan the manifest root path, find existed persistent manifest information
-        let manifest_files = scan_sorted_file_at_path(
-            manifest_root_path(&root_path).as_path(),
-            MANIFEST_FILE_EXTENSION,
-        )?;
+        let manifest_files =
+            scan_sorted_file_at_path(&config.manifest_path(), MANIFEST_FILE_EXTENSION)?;
         let (inner, next_log_seq) = if !manifest_files.is_empty() {
             // Read manifest in reverse order, find latest valid manifest snapshot
             let mut last_valid_manifest_binary: Option<Bytes> = None;
@@ -210,9 +203,9 @@ impl Manifest {
                 Some(data) => {
                     // Parsing manifest inner information
                     let inner = ManifestInner::decode_from_bytes(
-                        sstable_root_path(&root_path),
+                        config.sstable_path(),
                         data,
-                        &manager,
+                        &initial.sstable_manager,
                     )?;
                     (inner, manifest_files.last().unwrap().1 + 1)
                 }
@@ -224,24 +217,24 @@ impl Manifest {
         };
 
         // Open new persister
-        let mut persister = ManifestPersister::open(manifest_root_path(&root_path), next_log_seq)?;
+        let mut persister = ManifestPersister::open(config.manifest_path(), next_log_seq)?;
         // Persist manifest to the newest log and clear old manifest log
         persister.persist(&inner)?;
         persister.clear_old_manifest();
 
         Ok(Manifest {
             inner: Arc::new(RwLock::new(inner)),
-            root_path,
             persister: Arc::new(Mutex::new(persister)),
-            event_sender,
-            manager,
+            config,
+            initial,
         })
     }
 
     // Alloc a new sstable entry, and return its writer
     pub fn alloc_new_sstable_entry(&self, lv: usize) -> SSTableEntry {
-        self.manager
-            .alloc_entry(lv, sstable_root_path(&self.root_path))
+        self.initial
+            .sstable_manager
+            .alloc_entry(lv, self.config.sstable_path())
     }
 
     // Add a new sstable file into manifest, persist modification and update in-memory manifest
@@ -267,7 +260,7 @@ impl Manifest {
         *manifest = new_manifest;
 
         // Trigger to find new compact task
-        if let Err(err) = self.event_sender.notify(Event::Compact) {
+        if let Err(err) = self.initial.event_sender.notify(Event::Compact) {
             info!(
                 error = err.to_string(),
                 "receiver for compact trigger has been released"
@@ -340,7 +333,11 @@ impl Manifest {
         *manifest = new_manifest;
 
         // Clear old files
-        if let Err(err) = self.event_sender.notify(Event::InactiveSSTableClean) {
+        if let Err(err) = self
+            .initial
+            .event_sender
+            .notify(Event::InactiveSSTableClean)
+        {
             info!(
                 error = err.to_string(),
                 "receiver for clean sstable trigger has been released"
@@ -348,7 +345,7 @@ impl Manifest {
         }
 
         // Trigger to find new compact task
-        if let Err(err) = self.event_sender.notify(Event::Compact) {
+        if let Err(err) = self.initial.event_sender.notify(Event::Compact) {
             info!(
                 error = err.to_string(),
                 "receiver for compact trigger has been released"
@@ -437,7 +434,7 @@ impl Manifest {
 
     // Clean the inactive sstable on disk
     pub async fn clean_inactive_sstable(&self) -> Result<()> {
-        let path = sstable_root_path(&self.root_path);
+        let path = self.config.sstable_path();
         let mut reader = tokio::fs::read_dir(&path).await?;
         while let Ok(Some(entry)) = reader.next_entry().await {
             // Parse uid from filename
@@ -453,7 +450,7 @@ impl Manifest {
                 .and_then(std::ffi::OsStr::to_str)
                 .map(Uuid::from_str)
             {
-                if !self.manager.is_active_uuid(&uid) {
+                if !self.initial.sstable_manager.is_active_uuid(&uid) {
                     // Remove inactive uuid file
                     tokio::fs::remove_file(filepath).await?;
                     info!("remove inactive sstable file, {}", uid);
@@ -697,16 +694,6 @@ fn merge_tables(
 
     debug_assert_eq!(new_tables.len() + clear.len() - new_len, origin.len());
     new_tables
-}
-
-#[inline]
-fn sstable_root_path(path: &Path) -> PathBuf {
-    path.join("tables")
-}
-
-#[inline]
-fn manifest_root_path(path: &Path) -> PathBuf {
-    path.join("manifest")
 }
 
 // Open a new manifest file with given sequence number

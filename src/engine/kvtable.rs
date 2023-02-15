@@ -14,30 +14,6 @@ pub struct KVTable {
 }
 
 impl KVTable {
-    /// Initialize a kvtable from given iter and next_log_id
-    /// If next_log_id is zero, it will use first log_id of iteration
-    #[inline]
-    pub fn from_iter<I: Iterator<Item = Result<(u64, Bytes, Value)>>>(
-        seq_id: u64,
-        next_log_id: u64,
-        iter: I,
-    ) -> Result<Self> {
-        let mut table = Self::new(seq_id, next_log_id);
-
-        for data in iter {
-            let (log_id, key, value) = data?;
-            // Check log_id is increasing legally
-            if table.next_log_id == 0 {
-                table.next_log_id = log_id;
-            }
-            if table.next_log_id != log_id {
-                Err(Error::IllegalLog)?;
-            }
-            table.set(key, value);
-        }
-        Ok(table)
-    }
-
     // Create a new memtable
     #[inline]
     pub fn new(seq_id: u64, next_log_id: u64) -> KVTable {
@@ -92,11 +68,8 @@ impl KVTable {
     }
 
     #[inline]
-    pub fn log_id_range(&self) -> Option<(u64, u64)> {
-        if self.log_id_range.0 != 0 {
-            return Some(self.log_id_range);
-        }
-        None
+    pub fn log_id_range(&self) -> (u64, u64) {
+        self.log_id_range
     }
 
     /// Get next log id

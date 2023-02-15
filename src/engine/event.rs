@@ -1,18 +1,15 @@
 use super::{
-    compact::Compactor, kvtable::KVTable, manifest::Manifest, memtable::MemTable,
+    compact::Compactor, config::Timer, kvtable::KVTable, manifest::Manifest, memtable::MemTable,
     sstable::SSTableManager, Error, Result,
 };
 use crate::util::shutdown::Listener;
-use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
 };
 use tokio::{
     sync::mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
-    time::{interval, Interval},
+    time::interval,
 };
 use tracing::{info, warn};
 
@@ -39,26 +36,6 @@ pub enum Event {
     // Find compact task and do it
     // Timed or Trigger
     Compact,
-}
-
-pub struct Config {
-    pub enable_timer: bool,
-    pub inactive_reader_clean_period: Interval,
-    pub inactive_log_clean_period: Interval,
-    pub inactive_sstable_clean_period: Interval,
-    pub compact_period: Interval,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            enable_timer: true,
-            inactive_reader_clean_period: interval(Duration::from_secs(60)),
-            inactive_log_clean_period: interval(Duration::from_secs(500)),
-            inactive_sstable_clean_period: interval(Duration::from_secs(500)),
-            compact_period: interval(Duration::from_secs(60 * 10)),
-        }
-    }
 }
 
 pub struct EventLoopBuilder {
@@ -112,34 +89,43 @@ impl EventLoopBuilder {
     }
 
     // Start a event loop
-    pub fn run(mut self, mut config: Config) {
+    pub fn run(mut self, mut config: Timer) {
         assert!(self.manifest.is_some());
         assert!(self.memtable.is_some());
         assert!(self.shutdown.is_some());
         assert!(self.manager.is_some());
         let tx = self.tx.clone();
-        // Start timer
-        let mut shutdown = self.shutdown.take().unwrap();
-        let mut timer_shutdown = shutdown.clone();
 
+        let mut shutdown = self.shutdown.take().unwrap();
+
+        // Start timer
         if config.enable_timer {
+            let mut timer_shutdown = shutdown.clone();
             tokio::spawn(async move {
+                // Generate all ticker
+                let mut inactive_reader_clean_period =
+                    interval(config.inactive_reader_clean_period);
+                let mut inactive_log_clean_period = interval(config.inactive_log_clean_period);
+                let mut inactive_sstable_clean_period =
+                    interval(config.inactive_sstable_clean_period);
+                let mut compact_period = interval(config.compact_period);
+
                 loop {
                     if let Err(err) = tokio::select! {
                         _ = timer_shutdown.listen() => {
                             // Receive shutdown signal, stop timer
                             break;
                         }
-                        _ = config.inactive_reader_clean_period.tick() => {
+                        _ = inactive_reader_clean_period.tick() => {
                             tx.notify(Event::InactiveReaderClean)
                         }
-                        _ = config.inactive_log_clean_period.tick() => {
+                        _ = inactive_log_clean_period.tick() => {
                             tx.notify(Event::InactiveLogClean)
                         }
-                        _ = config.inactive_sstable_clean_period.tick() => {
+                        _ = inactive_sstable_clean_period.tick() => {
                             tx.notify(Event::InactiveSSTableClean)
                         }
-                        _ = config.compact_period.tick() => {
+                        _ = compact_period.tick() => {
                             tx.notify(Event::Compact)
                         }
                     } {

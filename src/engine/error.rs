@@ -12,6 +12,9 @@ pub enum Error {
     #[error("illegal log")]
     IllegalLog,
 
+    #[error("inconsistent log id")]
+    InconsistentLogId,
+
     #[error("bad sstable")]
     BadSSTable,
 

@@ -19,7 +19,7 @@ impl Default for Server {
     fn default() -> Self {
         let args = Args::parse();
         // Open database
-        let db = DB::open(args.root_path()).unwrap();
+        let db = DB::open(args.config()).unwrap();
         let shutdown = Notifier::new();
 
         Server { args, db, shutdown }

@@ -1,54 +1,44 @@
-use super::{
-    event::{Config, EventLoopBuilder},
-    manifest::Manifest,
-    memtable::MemTable,
-    sstable::SSTableManager,
-    util::Value,
-    Result,
-};
-use crate::util::shutdown::Notifier;
+use super::{config::Config, manifest::Manifest, memtable::MemTable, util::Value, Result};
+use crate::{engine::config::Initial, util::shutdown::Notifier};
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 
 #[derive(Clone)]
 pub struct DB {
-    manager: SSTableManager<tokio::fs::File>,
     manifest: Manifest,
     memtable: MemTable,
+    initial: Initial,
     shutdown: Arc<Mutex<Option<Notifier>>>,
 }
 
 impl DB {
     // Open levelDB on given path
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn open(config: Config) -> Result<Self> {
         info!("open DB...");
-        let path = path.into();
         let shutdown = Notifier::new();
-        let manager = SSTableManager::new();
-        let (event_sender, event_builder) = EventLoopBuilder::new();
+        let (initial, event_builder) = Initial::initial();
 
         info!("open manifest...");
-        let manifest = Manifest::open(path.clone(), event_sender.clone(), manager.clone())?;
+        let manifest = Manifest::open(config.clone(), initial.clone())?;
         info!("open memtable...");
-        let memtable = MemTable::open(path, event_sender)?;
+        let memtable = MemTable::open(config.clone(), initial.clone())?;
 
         // Start a background task
         event_builder
             .manifest(manifest.clone())
             .memtable(memtable.clone())
-            .manager(manager.clone())
+            .manager(initial.sstable_manager.clone())
             .shutdown(shutdown.listen().unwrap())
-            .run(Config::default());
+            .run(config.timer);
 
         info!("open DB complete");
         Ok(DB {
             manifest,
             memtable,
+            initial,
             shutdown: Arc::new(Mutex::new(Some(shutdown))),
-            manager,
         })
     }
 
@@ -65,7 +55,7 @@ impl DB {
         // Get possible sstables from manifest
         // Read sstable to search value
         for entry in self.manifest.search(key) {
-            let table = self.manager.open(entry).await?;
+            let table = self.initial.sstable_manager.open(entry).await?;
             if let Some(value) = table.search(key).await? {
                 match value {
                     Value::Living(v) | Value::LivingMeta(v, _) => return Ok(Some(v)),
@@ -101,10 +91,14 @@ impl DB {
 mod tests {
     use super::{super::event::Event, *};
     use crate::{
-        engine::event::{EventMessage, EventNotifier},
+        engine::{
+            event::{EventMessage, EventNotifier},
+            manifest,
+        },
         util::shutdown::Notifier,
     };
     use rand::Rng;
+    use std::path::PathBuf;
     use tempfile::tempdir;
     use tokio::{
         sync::mpsc::{unbounded_channel, UnboundedReceiver},
@@ -168,7 +162,7 @@ mod tests {
         info!("Test set/get key-value");
         let mut select = 0;
         {
-            let db = DB::open(root_path).unwrap();
+            let db = DB::open(Config::default_config_with_path(root_path)).unwrap();
             case.test_set(&db, select);
             select = 1;
             case.test_set(&db, select);
@@ -183,7 +177,7 @@ mod tests {
 
         info!("Test set/get after recovery");
         {
-            let db = DB::open(root_path).unwrap();
+            let db = DB::open(Config::default_config_with_path(root_path)).unwrap();
             case.test_set(&db, select);
             select = 1;
             case.test_set(&db, select);
@@ -201,7 +195,7 @@ mod tests {
         info!("Test set/get key-value");
         let mut select = 0;
         {
-            let db = DB::open(root_path).unwrap();
+            let db = DB::open(Config::default_config_with_path(root_path)).unwrap();
             case.test_set(&db, select);
             case.test_get(&db, select).await;
             db.shutdown().await
@@ -209,7 +203,7 @@ mod tests {
 
         info!("Test recover");
         {
-            let db = DB::open(root_path).unwrap();
+            let db = DB::open(Config::default_config_with_path(root_path)).unwrap();
             case.test_get(&db, select).await;
             select = 1;
             case.test_set(&db, select);
@@ -219,7 +213,7 @@ mod tests {
 
         info!("Test recover");
         {
-            let db = DB::open(root_path).unwrap();
+            let db = DB::open(Config::default_config_with_path(root_path)).unwrap();
             case.test_get(&db, select).await;
             select = 0;
             case.test_set(&db, select);
@@ -428,36 +422,35 @@ mod tests {
     fn create_background_full_control_db(
         path: impl Into<PathBuf> + Copy,
     ) -> (DB, EventNotifier, UnboundedReceiver<EventMessage>) {
+        // Disable timer
+        let mut config = Config::default_config_with_path(path.into());
         let shutdown = Notifier::new();
+
+        // Create a manually control event
+        let (mut initial, event_builder) = Initial::initial();
         let (fake_event_sender, _rx) = unbounded_channel();
-        let (event_sender, event_builder) = EventLoopBuilder::new();
-        let fake_event_sender = EventNotifier::new(fake_event_sender);
+        let mut fake_event_sender = EventNotifier::new(fake_event_sender);
+        std::mem::swap(&mut initial.event_sender, &mut fake_event_sender);
+        // Now, fake_event_sender is the true event sender.
 
-        let manifest =
-            Manifest::open(path, fake_event_sender.clone(), SSTableManager::new()).unwrap();
-        let memtable = MemTable::open(path, fake_event_sender).unwrap();
-        let manager = SSTableManager::new();
-
+        let manifest = Manifest::open(config.clone(), initial.clone()).unwrap();
+        let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
         // Start a background task
-        let config = Config {
-            enable_timer: false,
-            ..Default::default()
-        };
         event_builder
             .manifest(manifest.clone())
             .memtable(memtable.clone())
-            .manager(manager.clone())
+            .manager(initial.sstable_manager.clone())
             .shutdown(shutdown.listen().unwrap())
-            .run(config);
+            .run(config.timer.clone());
 
         let db = DB {
             manifest,
             memtable,
+            initial,
             shutdown: Arc::new(Mutex::new(Some(shutdown))),
-            manager,
         };
 
-        (db, event_sender, _rx)
+        (db, fake_event_sender, _rx)
     }
 
     struct TestCase {

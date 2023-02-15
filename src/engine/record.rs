@@ -10,7 +10,7 @@
 use crate::util::{checksum, from_le_bytes_32, read_exact};
 
 use super::{Error, Result};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use bytes::{Buf, Bytes};
 
@@ -43,13 +43,13 @@ impl From<u8> for RecordType {
 }
 
 // Read and parse item from given bytes stream, implemented as a Iterator
-pub struct RecordReader<R: Read> {
+pub struct RecordReader<R: Read + Seek> {
     reader: R,
     buffer: Vec<u8>,
     offset: usize,
 }
 
-impl<R: Read> RecordReader<R> {
+impl<R: Read + Seek> RecordReader<R> {
     pub fn new(reader: R) -> Self {
         let mut r = RecordReader {
             reader,
@@ -62,6 +62,13 @@ impl<R: Read> RecordReader<R> {
         // buffer size mut be RECORD_BLOCK_SIZE
         debug_assert_eq!(r.buffer.len(), RECORD_BLOCK_SIZE);
         r
+    }
+
+    /// Get total offset has been iterated
+    #[inline]
+    pub fn offset(&mut self) -> Result<u64> {
+        let seek_offset = self.reader.seek(SeekFrom::Current(0))?;
+        Ok(seek_offset + self.offset as u64)
     }
 
     // Parse a new record, act as a cursor
@@ -111,7 +118,7 @@ impl<R: Read> RecordReader<R> {
     }
 }
 
-impl<R: Read> Iterator for RecordReader<R> {
+impl<R: Read + Seek> Iterator for RecordReader<R> {
     type Item = Result<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {

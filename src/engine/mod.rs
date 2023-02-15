@@ -1,5 +1,6 @@
 mod block;
 mod compact;
+mod config;
 mod db;
 mod error;
 mod event;
@@ -10,6 +11,7 @@ mod record;
 mod sstable;
 mod util;
 
+pub use config::Config;
 pub use db::DB;
 pub use error::Error;
 

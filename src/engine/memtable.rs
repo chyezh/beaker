@@ -1,5 +1,6 @@
 use super::{
-    event::{Event, EventNotifier},
+    config::{Config, Initial},
+    event::Event,
     kvtable::KVTable,
     record::{RecordReader, RecordWriter},
     util::{async_scan_file_at_path, scan_sorted_file_at_path, Value},
@@ -11,7 +12,7 @@ use futures_core::Future;
 use parking_lot::{Mutex, RwLock};
 use std::{
     fs::{self, File, OpenOptions},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -28,74 +29,60 @@ const LOG_FILE_EXTENSION: &str = "log";
 pub struct MemTable {
     mutable: Arc<Mutex<(KVTable, RecordWriter<File>)>>,
     immutable: Arc<RwLock<Vec<Arc<KVTable>>>>,
-    root_path: PathBuf,
     next_log_seq: Arc<AtomicU64>,
-    event_notifier: EventNotifier,
     dump_mutex: Arc<tokio::sync::Mutex<()>>,
+    config: Config,
+    initial: Initial,
 }
 
 impl MemTable {
-    pub fn open(root_path: impl Into<PathBuf>, event_notifier: EventNotifier) -> Result<Self> {
+    /// Recover memtable from log until max_log_id.
+    pub fn open(config: Config, initial: Initial) -> Result<Self> {
         // Try to create log root directory at this path.
-        let root_path: PathBuf = root_path.into();
-        fs::create_dir_all(root_path.as_path())?;
+        fs::create_dir_all(config.log_path())?;
 
         // Scan the root_path directory, find all log sorted by sequence number
-        let log_files = scan_sorted_file_at_path(&root_path, LOG_FILE_EXTENSION)?;
+        let log_files = scan_sorted_file_at_path(&config.log_path(), LOG_FILE_EXTENSION)?;
 
-        let mut next_log_id = 0;
+        let mut last_log_id = 0;
+
         // Recover immutables
-        let (immutable, next_log_seq) = if !log_files.is_empty() {
+        let (immutable, mut last_log_seq) = if !log_files.is_empty() {
             let mut tables = Vec::with_capacity(log_files.len());
 
             // Recover immutable memtable
-            for (path, seq) in log_files.iter() {
-                let reader = RecordReader::new(File::open(path.as_path())?);
-
-                let table = KVTable::from_iter(
-                    *seq,
-                    next_log_id,
-                    reader.map(|data| {
-                        let data = data?;
-                        decode_kv(data)
-                    }),
-                )?;
-
-                // Skip empty table
-                if table.is_empty() {
-                    continue;
+            for (path, seq_id) in log_files.iter() {
+                // Recover a new memtable from a log file
+                if let Some(table) = recover_log(path, *seq_id, last_log_id)? {
+                    // Old tables never write new entry
+                    let immutable_table = Arc::new(table);
+                    tables.push(Arc::clone(&immutable_table));
                 }
-
-                next_log_id = table.next_log_id();
-
-                // Old tables never write new entry
-                let immutable_table = Arc::new(table);
-                tables.push(Arc::clone(&immutable_table));
             }
-            (tables, log_files.last().unwrap().1 + 1)
+            (tables, log_files.last().unwrap().1)
         } else {
             (Vec::new(), 0)
         };
 
         // Create new mutable to write
-        let mutable = open_new_log(&root_path, next_log_seq, next_log_id)?;
+        last_log_seq += 1;
+        last_log_id += 1;
+        let mutable = open_new_log(&config.log_path(), last_log_seq, last_log_id)?;
 
         // Try to dump old immutable memtable
         if !immutable.is_empty() {
-            let send_result = event_notifier.notify(Event::Dump);
+            let send_result = initial.event_sender.notify(Event::Dump);
             debug_assert!(send_result.is_ok());
         }
 
-        let table = MemTable {
+        Ok(MemTable {
             mutable: Arc::new(Mutex::new(mutable)),
             immutable: Arc::new(RwLock::new(immutable)),
-            root_path,
-            next_log_seq: Arc::new(AtomicU64::new(next_log_seq + 1)),
-            event_notifier,
+            next_log_seq: Arc::new(AtomicU64::new(last_log_seq + 1)),
             dump_mutex: Arc::new(tokio::sync::Mutex::new(())),
-        };
-
-        Ok(table)
+            config,
+            initial,
+        })
     }
 
     // Get the value by key
@@ -134,7 +121,7 @@ impl MemTable {
 
             // Create a new writer
             let mut new_mutable =
-                open_new_log(&self.root_path, new_log_seq, mutable.0.next_log_id())?;
+                open_new_log(&self.config.root_path, new_log_seq, mutable.0.next_log_id())?;
 
             // Swap mutable, close writer, and convert old mutable into immutable
             std::mem::swap(&mut *mutable, &mut new_mutable);
@@ -147,7 +134,7 @@ impl MemTable {
 
             // Send a dump request
             // Send operation would never fail
-            let result = self.event_notifier.notify(Event::Dump);
+            let result = self.initial.event_sender.notify(Event::Dump);
             debug_assert!(result.is_ok());
         }
 
@@ -181,7 +168,7 @@ impl MemTable {
             *tables = new_tables;
 
             // Try to clear log
-            if let Err(err) = self.event_notifier.notify(Event::InactiveLogClean) {
+            if let Err(err) = self.initial.event_sender.notify(Event::InactiveLogClean) {
                 info!(
                     error = err.to_string(),
                     "receiver for inactive log clean trigger has been released"
@@ -194,7 +181,8 @@ impl MemTable {
 
     // Clean the inactive memtable log
     pub async fn clean_inactive_log(&self) -> Result<()> {
-        let filenames = async_scan_file_at_path(&self.root_path, LOG_FILE_EXTENSION).await?;
+        let filenames =
+            async_scan_file_at_path(&self.config.log_path(), LOG_FILE_EXTENSION).await?;
 
         // at least one mutable memtable
         if filenames.len() <= 1 {
@@ -220,6 +208,40 @@ impl MemTable {
 
         Ok(())
     }
+}
+
+/// Recover a table from given log sequence id
+fn recover_log(path: &Path, seq_id: u64, mut last_log_id: u64) -> Result<Option<KVTable>> {
+    let reader = RecordReader::new(File::open(path)?);
+    let mut table = None;
+
+    for data in reader {
+        let (log_id, key, value) = decode_kv(data?)?;
+        // Initialize log id
+        if last_log_id == 0 {
+            last_log_id = log_id;
+        } else {
+            last_log_id += 1;
+        }
+
+        // Check log_id consistency
+        if last_log_id != log_id {
+            Err(Error::InconsistentLogId)?;
+        }
+
+        if table.is_none() {
+            table = Some(KVTable::new(seq_id, last_log_id));
+        }
+        table.as_mut().unwrap().set(key, value);
+    }
+
+    // Skip empty table
+    if table.is_none() || table.as_ref().unwrap().is_empty() {
+        return Ok(None);
+    }
+    debug_assert_eq!(last_log_id, table.as_ref().unwrap().log_id_range().1);
+
+    Ok(table)
 }
 
 // Encode the KV pair into binary format. While no checksum is applied on here, record writer downside has promised. Layout:
@@ -276,13 +298,10 @@ fn open_new_log(dir: &Path, log_seq: u64, log_id: u64) -> Result<(KVTable, Recor
 
 #[cfg(test)]
 mod tests {
-    use core::panic;
-
-    use tempfile::tempdir;
-    use tokio::sync::mpsc::unbounded_channel;
-
     use super::*;
     use crate::util::test_case::generate_random_bytes;
+    use core::panic;
+    use tempfile::tempdir;
 
     #[test]
     fn test_log_with_random_case() {
@@ -292,12 +311,12 @@ mod tests {
 
         let test_case_key = generate_random_bytes(test_count, 10000);
         let test_case_value = generate_random_bytes(test_count, 10 * 32 * 1024);
-        let (tx, _rx) = unbounded_channel();
 
-        let tx = EventNotifier::new(tx);
+        let config = Config::default_config_with_path(root_path.to_path_buf());
+        let (initial, _event_builder) = Initial::initial();
 
         // Test normal value
-        let memtable = MemTable::open(root_path, tx.clone()).unwrap();
+        let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             memtable
                 .set(key.clone(), Value::Living(value.clone()))
@@ -305,7 +324,7 @@ mod tests {
         }
 
         drop(memtable);
-        let memtable = MemTable::open(root_path, tx.clone()).unwrap();
+        let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             if let Some(Value::Living(v)) = memtable.get(key) {
                 assert_eq!(value, &v);
@@ -323,7 +342,7 @@ mod tests {
         }
 
         drop(memtable);
-        let memtable = MemTable::open(root_path, tx.clone()).unwrap();
+        let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
         for ((key, value), is_deleted) in test_case_key
             .iter()
             .zip(test_case_value.iter())
@@ -352,7 +371,7 @@ mod tests {
         }
 
         drop(memtable);
-        let memtable = MemTable::open(root_path, tx).unwrap();
+        let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
         for (key, value) in test_case_key.iter().zip(test_case_value.iter()) {
             if let Some(Value::Living(v)) = memtable.get(key) {
                 assert_eq!(value, &v);
