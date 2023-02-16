@@ -18,7 +18,6 @@ const OTHER_VALUE_TYPE_HEADER: usize = 1;
 pub enum Value {
     Living(Bytes),
 
-    // Deleted value
     Tombstone,
 
     // Meta data is promised to live on log, but not on sstable

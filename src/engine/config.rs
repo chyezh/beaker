@@ -13,6 +13,15 @@ pub struct Config {
     // Timer for event in database
     #[serde(default)]
     pub timer: Timer,
+
+    /// Recover log id util target log id if it's Some,
+    /// otherwise recover to newest log id
+    #[serde(skip)]
+    pub target_log_id: Option<u64>,
+
+    /// Max log id can be dump into sstable, no limit if it's None.
+    #[serde(skip)]
+    pub dump_log_id: Option<u64>,
 }
 
 impl Config {
@@ -33,6 +42,8 @@ impl Config {
         Config {
             root_path: root_path.into(),
             timer: Timer::default(),
+            target_log_id: None,
+            dump_log_id: None,
         }
     }
 
@@ -82,7 +93,6 @@ impl Default for Timer {
 pub struct Initial {
     pub event_sender: EventNotifier,
     pub sstable_manager: SSTableManager<tokio::fs::File>,
-    pub max_log_id: Option<u64>,
 }
 
 impl Initial {
@@ -94,7 +104,6 @@ impl Initial {
             Initial {
                 event_sender,
                 sstable_manager: manager,
-                max_log_id: None,
             },
             event_builder,
         )

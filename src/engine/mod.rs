@@ -8,6 +8,7 @@ mod kvtable;
 mod manifest;
 mod memtable;
 mod record;
+mod snapshot;
 mod sstable;
 mod util;
 

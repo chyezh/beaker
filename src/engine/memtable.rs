@@ -12,7 +12,7 @@ use futures_core::Future;
 use parking_lot::{Mutex, RwLock};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufWriter, Seek, SeekFrom},
+    io::{Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -34,6 +34,8 @@ pub struct MemTable {
     dump_mutex: Arc<tokio::sync::Mutex<()>>,
     config: Config,
     initial: Initial,
+    // Max log id can be dump into sstable, no limit if it's None.
+    dump_log_id: Arc<Mutex<Option<u64>>>,
 }
 
 impl MemTable {
@@ -46,6 +48,7 @@ impl MemTable {
         let log_files = scan_sorted_file_at_path(&config.log_path(), LOG_FILE_EXTENSION)?;
 
         let mut last_log_id = 0;
+        let dump_log_id = config.dump_log_id;
 
         // Recover immutables
         let (immutable, mut last_log_seq) = if !log_files.is_empty() {
@@ -53,7 +56,7 @@ impl MemTable {
 
             // Recover immutable memtable
             for (path, seq_id) in log_files.iter() {
-                match recover_log(path, *seq_id, last_log_id, initial.max_log_id)? {
+                match recover_log(path, *seq_id, last_log_id, config.target_log_id)? {
                     (Some(table), None) => {
                         // Old tables never write new entry
                         last_log_id = table.log_id_range().1;
@@ -69,6 +72,7 @@ impl MemTable {
                             dump_mutex: Arc::new(tokio::sync::Mutex::new(())),
                             config,
                             initial,
+                            dump_log_id: Arc::new(Mutex::new(dump_log_id)),
                         });
                     }
                     _ => continue,
@@ -97,6 +101,7 @@ impl MemTable {
             dump_mutex: Arc::new(tokio::sync::Mutex::new(())),
             config,
             initial,
+            dump_log_id: Arc::new(Mutex::new(dump_log_id)),
         })
     }
 
@@ -159,6 +164,16 @@ impl MemTable {
         Ok(log_id)
     }
 
+    /// Permit: dump operation can be applied to log util given new_log_id.
+    /// Dump log id always grows monotonic, and never be set as Some when it's initialized as None.
+    pub fn permit_dump_util(&self, new_log_id: u64) -> Result<()> {
+        let mut dump_log_id = self.dump_log_id.lock();
+        if matches!(*dump_log_id, Some(log_id) if log_id <= new_log_id) {
+            *dump_log_id = Some(new_log_id);
+        }
+        Err(Error::IllegalDumpLogId)
+    }
+
     // Dump oldest immutable memtable and remove it
     pub async fn dump_oldest_immutable<
         C: FnOnce(Vec<Arc<KVTable>>) -> E,
@@ -172,7 +187,20 @@ impl MemTable {
         if _guard.is_err() {
             return Ok(());
         }
-        let immutable = self.immutable.read().clone();
+        let dump_log_id = *self.dump_log_id.lock();
+
+        // Filter all dump able immutable tables
+        let immutable = if let Some(dump_log_id) = dump_log_id {
+            self.immutable
+                .read()
+                .iter()
+                .take_while(|&table| table.log_id_range().1 <= dump_log_id)
+                .map(Arc::clone)
+                .collect()
+        } else {
+            self.immutable.read().clone()
+        };
+
         let immutable_len = immutable.len();
         if immutable_len > 0 {
             // Try to Dump all immutable
@@ -396,8 +424,8 @@ mod tests {
         let test_case_key = generate_step_by_bytes(test_count);
         let test_case_value = generate_random_bytes(test_count, 32 * 10 * 1024);
 
-        let config = Config::default_config_with_path(root_path.to_path_buf());
-        let (mut initial, _event_builder) = Initial::new();
+        let mut config = Config::default_config_with_path(root_path.to_path_buf());
+        let (initial, _event_builder) = Initial::new();
 
         // Create case
         let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
@@ -411,7 +439,7 @@ mod tests {
         // Recover part twice
         for recover_count in [1, test_count / 3, test_count / 2, test_count] {
             // Recover half of test
-            initial.max_log_id = Some(recover_count as u64);
+            config.target_log_id = Some(recover_count as u64);
             let memtable = MemTable::open(config.clone(), initial.clone()).unwrap();
             for (offset, (key, value)) in
                 test_case_key.iter().zip(test_case_value.iter()).enumerate()

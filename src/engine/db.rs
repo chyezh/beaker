@@ -14,7 +14,7 @@ pub struct DB {
 }
 
 impl DB {
-    // Open levelDB on given path
+    /// Open levelDB on given path
     pub fn open(config: Config) -> Result<Self> {
         info!("open DB...");
         let shutdown = Notifier::new();
@@ -42,7 +42,7 @@ impl DB {
         })
     }
 
-    // Get value from db by key
+    /// Get value from db by key
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         // Get memtable first
         if let Some(value) = self.memtable.get(key) {
@@ -68,14 +68,35 @@ impl DB {
         Ok(None)
     }
 
-    // Set key value pair into db and return log_id of the write operation
+    /// Set key value pair into db and return log_id of the write operation
+    #[inline]
     pub fn set(&self, key: Bytes, value: Bytes) -> Result<u64> {
         self.memtable.set(key, Value::Living(value))
     }
 
-    // Delete value by key and return log_id of the write operation
+    /// Delete value by key and return log_id of the write operation
+    #[inline]
     pub fn del(&self, key: Bytes) -> Result<u64> {
         self.memtable.set(key, Value::Tombstone)
+    }
+
+    /// Set key value pair into db and return log_id of the write operation
+    #[inline]
+    pub fn set_with_meta(&self, key: Bytes, value: Bytes, meta: Bytes) -> Result<u64> {
+        self.memtable.set(key, Value::LivingMeta(value, meta))
+    }
+
+    /// Delete value by key and return log_id of the write operation
+    #[inline]
+    pub fn del_with_meta(&self, key: Bytes, meta: Bytes) -> Result<u64> {
+        self.memtable.set(key, Value::TombstoneMeta(meta))
+    }
+
+    /// Permit: dump operation can be applied to log util given new_log_id.
+    /// Dump log id always grows monotonic, and never be set as Some when it's initialized as None.
+    #[inline]
+    pub fn permit_dump_util(&self, new_log_id: u64) -> Result<()> {
+        self.memtable.permit_dump_util(new_log_id)
     }
 
     // Shutdown the database, and drop the database

@@ -15,6 +15,9 @@ pub enum Error {
     #[error("given target log id was consumed")]
     TargetLogIdConsumed,
 
+    #[error("illegal dump log id was applied")]
+    IllegalDumpLogId,
+
     #[error("inconsistent log id")]
     InconsistentLogId,
 
