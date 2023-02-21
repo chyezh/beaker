@@ -37,7 +37,7 @@
 
 ### 分布式部分
 
-- [ ] `Raft`协议（开发分支[beaker-v0.2.0](https://github.com/chyezh/beaker/tree/beaker-v0.2.0/src/raft))
+- [ ] `Raft`协议（开发分支 [beaker-v0.2.0](https://github.com/chyezh/beaker/tree/beaker-v0.2.0/src/raft))
   - [x] 主节点选举
   - [ ] 日志复制
   - [ ] 快照安装

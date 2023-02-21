@@ -38,7 +38,7 @@ Guide to modules:
 
 ### Distribution infrastructure
 
-- [ ] `Raft` protocol (brunch[beaker-v0.2.0](https://github.com/chyezh/beaker/tree/beaker-v0.2.0/src/raft))
+- [ ] `Raft` protocol (brunch [beaker-v0.2.0](https://github.com/chyezh/beaker/tree/beaker-v0.2.0/src/raft))
   - [x] leader election
   - [ ] log replication
   - [ ] snapshot installation
