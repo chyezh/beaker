@@ -1,31 +1,50 @@
 # beaker
 
-`Beaker`的开发目标是一个使用`Rust`开发的分布式`KV`数据库。
+[中文](./docs/CH_README.md)|[english](./README.md)
 
-## 里程碑
+`beaker` is a distributed key-value database under development for learning `Rust`/`Database`/`Distributed System`.
 
-### 基础功能
+## Repository content
 
-- [x] 支持基础的`get`/`set`/`del`等操作。
+Guide to modules:
 
-### 基础部分
+- `src/engine`: A lsm-tree-based storage engine like `leveldb`.
+- `src/server`: A implementation of database server.
+- `src/cmd`: A redis-like command library.
+- `src/cli`: A command line client tool.
+- `src/client`: `Rust` Database Client.
+- `src/resp`: A `RESP` protocol for exchanging data between client and server.
+- `src/raft`: A `RAFT` protocol for exchanging data between one server node and another.
 
-- [x] 基于`LevelDB`设计思路的`KV`存储引擎
-  - [x] `memtable+log`实现
-  - [x] `manifest`实现
-  - [x] `sstable`实现
-  - [x] 包含`compact`/日志清理等一系列后台功能
-  - [x] 功能整合，DB功能封装
-- [x] 基于`Redis`的`Resp`的数据交换协议
-- [x] 服务端入口
-- [x] 客户端命令行工具
-- [x] 优雅退出
+## Milestones
 
-### 分布式部分
+### Basic functional
 
-- [ ] `Raft`协议（进行中，当前已开发选举部分）
+- [x] Support `set`/`get`/`del` command.
 
-## 参考与引用
+### Standalone infrastructure
+
+- [x] `lsm` tree based kv storage
+  - [x] A `memtable+log` implementation
+  - [x] A `sstable` implementation
+  - [x] A `manifest` for managing sstables and logs
+  - [x] Background task, `sstable compact`/`log dumping`/`expire file cleaning`...
+  - [x] Database interface
+- [x] `Resp` protocol
+- [x] Database server
+- [x] Rust client
+- [x] command-line client tool
+- [x] gentle shutdown
+
+### Distribution infrastructure
+
+- [ ] `Raft` protocol (brunch [beaker-v0.2.0](https://github.com/chyezh/beaker/tree/beaker-v0.2.0/src/raft))
+  - [x] leader election
+  - [ ] log replication
+  - [ ] snapshot installation
+  - [ ] configure modification
+
+## References
 
 - [levelDB](https://github.com/google/leveldb)
 - [pingcap/talent-plan](https://github.com/pingcap/talent-plan)
