@@ -4,6 +4,32 @@
 
 `beaker` is a distributed key-value database under development for learning `Rust`/`Database`/`Distributed System`.
 
+## Usage
+
+If you're a Rust programmer, build and it with `cargo`. 
+
+    # run the database server at root path with log at info level
+    RUST_LOG=info cargo run --release --bin server -- --root-path $path
+
+    # run command line
+    cargo run --release --bin cli
+
+    # apply command use cli
+    get key
+    set key val
+    del key
+    ping msg
+
+    # or using src/client in crate to apply command
+    async {
+        let client = Client::connect($addr).await?;
+        client.ping(None).await?;
+    }
+
+If you want to install it, using `cargo install --path .`.
+
+If you want in uninstall it, using `cargo uninstall beaker`.
+
 ## Repository content
 
 Guide to modules:

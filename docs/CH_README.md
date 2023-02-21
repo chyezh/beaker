@@ -4,11 +4,37 @@
 
 `Beaker`的开发目标是一个使用`Rust`开发的分布式`KV`数据库，用于学习`Rust`/数据库/分布式系统。
 
+## 使用方式
+
+如果你是`Rust`开发者，使用`cargo`编译与构建工程。
+
+    # 在给定的path下与info等级的日志下，运行数据库服务端
+    RUST_LOG=info cargo run --release --bin server -- --root-path $path
+
+    # 运行命令行客户端工具
+    cargo run --release --bin cli
+
+    # 使用类似于redis的命令操作数据库
+    get key
+    set key val
+    del key
+    ping msg
+
+    # 或者使用 src/client 模块下的Client客户端操作数据库
+    async {
+        let client = Client::connect($addr).await?;
+        client.ping(None).await?;
+    }
+
+如果你想安装`server`和`cli`，使用`cargo install --path .`。
+
+如果你想卸载，使用`cargo uninstall beaker`。
+
 ## 工程结构
 
 相关模块导引如下：
 
-- - `src/engine`: 基于`LSM-Tree`的存储引擎。
+- `src/engine`: 基于`LSM-Tree`的存储引擎。
 - `src/server`: 数据库服务器实现。
 - `src/cmd`: 类似`Redis`的命令库。
 - `src/cli`: 命令行客户端工具。
